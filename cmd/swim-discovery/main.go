@@ -6,9 +6,17 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"fmt"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/akomyagin/swim-discovery/internal/member"
+	"github.com/akomyagin/swim-discovery/internal/swim"
+	"github.com/akomyagin/swim-discovery/internal/transport"
 )
 
 func main() {
@@ -18,12 +26,35 @@ func main() {
 	)
 	flag.Parse()
 
-	// TODO(Этап 1): bind transport.NewUDP(*addr), build member.List, run the
-	// direct ping/ack probe loop.
+	// v1 convention: node ID is its "host:port" address.
+	self := member.Member{ID: member.ID(*addr), Addr: *addr, State: member.StateAlive}
+	list := member.NewList(self)
+
+	// A full join handshake arrives with gossip in Этап 2; for direct ping it
+	// is enough to pre-seed the peer so the probe loop has a target.
+	if *seed != "" && *seed != *addr {
+		list.Merge(member.Member{ID: member.ID(*seed), Addr: *seed, State: member.StateAlive})
+	}
+
+	tr, err := transport.NewUDP(*addr)
+	if err != nil {
+		log.Fatalf("swim-discovery: %v", err)
+	}
+	defer tr.Close()
+
 	// TODO(Этап 2): start the gossip dissemination loop.
 	// TODO(Этап 3): wire indirect probing (PingReq to K random peers).
 	// TODO(Этап 4): run the suspicion-timeout scheduler.
 	// TODO(Этап 5): add the `members`/observe CLI subcommand.
-	fmt.Fprintf(os.Stderr, "swim-discovery: not implemented yet (addr=%s seed=%q)\n", *addr, *seed)
-	os.Exit(1)
+	node := swim.NewNode(list, tr, swim.Config{
+		ProbeInterval: time.Second,
+		RTTTimeout:    300 * time.Millisecond,
+	})
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log.Printf("swim-discovery node %s started (seed=%q)", *addr, *seed)
+	node.Run(ctx)
+	log.Printf("swim-discovery node %s stopped", *addr)
 }

@@ -13,7 +13,11 @@
 // A compact binary framing is a POST_MVP concern.
 package protocol
 
-import "github.com/akomyagin/swim-discovery/internal/member"
+import (
+	"encoding/json"
+
+	"github.com/akomyagin/swim-discovery/internal/member"
+)
 
 // Kind tags the message type in the envelope.
 type Kind uint8
@@ -50,17 +54,14 @@ type Message struct {
 
 // Encode serializes a Message into a transport payload.
 //
-// TODO(Этап 1): implement via encoding/json (Ping/Ack only);
 // TODO(Этап 2): include piggybacked Updates.
 func Encode(m Message) ([]byte, error) {
-	_ = m
-	panic("TODO(Этап 1): Encode not implemented")
+	return json.Marshal(m)
 }
 
 // Decode parses a transport payload back into a Message.
-//
-// TODO(Этап 1): implement.
 func Decode(payload []byte) (Message, error) {
-	_ = payload
-	panic("TODO(Этап 1): Decode not implemented")
+	var m Message
+	err := json.Unmarshal(payload, &m)
+	return m, err
 }
