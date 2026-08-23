@@ -3,6 +3,8 @@ package protocol
 import (
 	"reflect"
 	"testing"
+
+	"github.com/akomyagin/swim-discovery/internal/member"
 )
 
 func TestEncodeDecode_RoundTrip(t *testing.T) {
@@ -43,6 +45,34 @@ func TestEncodeDecode_RoundTrip(t *testing.T) {
 				t.Errorf("Updates after round-trip = %+v, want empty (omitempty)", got.Updates)
 			}
 		})
+	}
+}
+
+// TestEncodeDecode_WithUpdates fixes that a piggybacked gossip batch survives
+// the wire round-trip with every field (including State) intact.
+func TestEncodeDecode_WithUpdates(t *testing.T) {
+	msg := Message{
+		Kind:  KindPing,
+		From:  "A",
+		SeqNo: 1,
+		Updates: []Update{
+			{ID: "B", Addr: "B", Incarnation: 2, State: member.StateSuspect},
+			{ID: "C", Addr: "C", Incarnation: 5, State: member.StateAlive},
+		},
+	}
+	payload, err := Encode(msg)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := Decode(payload)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Updates) != 2 {
+		t.Fatalf("Updates after round-trip = %d records, want 2", len(got.Updates))
+	}
+	if !reflect.DeepEqual(got, msg) {
+		t.Errorf("round-trip = %+v, want %+v", got, msg)
 	}
 }
 

@@ -30,8 +30,9 @@ func main() {
 	self := member.Member{ID: member.ID(*addr), Addr: *addr, State: member.StateAlive}
 	list := member.NewList(self)
 
-	// A full join handshake arrives with gossip in Этап 2; for direct ping it
-	// is enough to pre-seed the peer so the probe loop has a target.
+	// Pre-seeding the peer gives the probe loop its first target; the Merge
+	// also queues the seed for gossip, and NewList queues self, so the join
+	// becomes two-sided as soon as probes start flowing.
 	if *seed != "" && *seed != *addr {
 		list.Merge(member.Member{ID: member.ID(*seed), Addr: *seed, State: member.StateAlive})
 	}
@@ -42,7 +43,8 @@ func main() {
 	}
 	defer tr.Close()
 
-	// TODO(Этап 2): start the gossip dissemination loop.
+	// Gossip needs no dedicated loop: membership updates piggyback on the
+	// probe/ack traffic that Node.Run already drives (Этап 2).
 	// TODO(Этап 3): wire indirect probing (PingReq to K random peers).
 	// TODO(Этап 4): run the suspicion-timeout scheduler.
 	// TODO(Этап 5): add the `members`/observe CLI subcommand.
