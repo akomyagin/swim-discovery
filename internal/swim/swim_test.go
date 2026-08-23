@@ -1040,6 +1040,297 @@ func TestNode_SuspectAtHigherIncarnation_RestartsTimer(t *testing.T) {
 	}
 }
 
+// ---- Этап 5: false-positive scenarios on the grown network simulator -----
+//
+// Live nodes via startNode, wall-clock RTT/Indirect timeouts (the default
+// systemClock) — the same pattern as TestNode_IndirectProbe_*. fakeClock is
+// deliberately NOT used here: the simulator's delay runs on real time and does
+// not share a timescale with suspicion timers (Этап 5 decision).
+
+// TestNode_HighDropRate_NoIndirect_MarksSuspect is the "problem" half of the
+// Этап 5 contrast pair: 100% loss on the initiator's link to a LIVE target,
+// and no mediators available — in a 2-node cluster the only Other IS the
+// target, so the indirect phase is skipped regardless of IndirectNodes (a
+// config value of 0 would be re-defaulted to 3 by NewNode anyway; the topology
+// disables indirect deterministically). With nothing to rescue the probe, the
+// live target gets falsely suspected. Rate 1.0 short-circuits the RNG, so the
+// outcome does not depend on the seed.
+func TestNode_HighDropRate_NoIndirect_MarksSuspect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	// Only the initiator's outbound link is lossy; T itself is alive and its
+	// own links work — the suspicion asserted below is false by construction.
+	network.SetDropRate("I", "T", 1.0)
+
+	listI := fullList("I", "I", "T")
+	listT := fullList("T", "I", "T")
+
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: 50 * time.Millisecond, IndirectTimeout: 150 * time.Millisecond}
+	cfgI := cfg
+	cfgI.Rand = rand.New(rand.NewSource(1)) // Others() == [T]: the target choice is forced anyway
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeT := NewNode(listT, trT, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopT := startNode(t, nodeT)
+	defer stopT()
+
+	nodeI.probeOnce(ctx)
+
+	rec, ok := listI.Get("T")
+	if !ok {
+		t.Fatal("T missing from listI after probe")
+	}
+	if rec.State != member.StateSuspect {
+		t.Errorf("T state = %v, want suspect — without mediators a lossy link produces a false positive", rec.State)
+	}
+}
+
+// TestNode_HighDropRate_WithIndirect_SuppressesFalsePositive restates the
+// project's central invariant through the new SetDropRate knob: BOTH direct
+// links between I and T are 100% lossy, yet T must stay Alive because the
+// relay path through M is intact — the grown simulator must not have broken
+// the Этап 3 rescue.
+func TestNode_HighDropRate_WithIndirect_SuppressesFalsePositive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	// Both directions of the direct I<->T path are dead (not even a direct Ack
+	// can slip back); I<->M and M<->T stay perfect — only the relay saves T.
+	network.SetDropRate("I", "T", 1.0)
+	network.SetDropRate("T", "I", 1.0)
+
+	listI := fullList("I", "I", "M", "T")
+	listM := fullList("M", "I", "M", "T")
+	listT := fullList("T", "I", "M", "T")
+
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: 100 * time.Millisecond, IndirectTimeout: 2 * time.Second}
+	cfgI := cfg
+	// Seed 1: the first Intn(2) yields 1, so the probe target is Others()[1]
+	// == T (Others sorts by ID: [M, T]) — same as the Этап 3 central test.
+	cfgI.Rand = rand.New(rand.NewSource(1))
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeM := NewNode(listM, trM, cfg)
+	nodeT := NewNode(listT, trT, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopM := startNode(t, nodeM)
+	defer stopM()
+	stopT := startNode(t, nodeT)
+	defer stopT()
+
+	start := time.Now()
+	nodeI.probeOnce(ctx)
+	elapsed := time.Since(start)
+
+	// The direct phase must have burned (most of) its RTTTimeout — the I->T
+	// link is fully lossy. A near-instant return would mean the probe hit M.
+	if elapsed < cfg.RTTTimeout/2 {
+		t.Fatalf("probeOnce returned in %v (RTTTimeout %v) — direct ping got answered, so the probe target was not T", elapsed, cfg.RTTTimeout)
+	}
+
+	rec, ok := listI.Get("T")
+	if !ok {
+		t.Fatal("T missing from listI after probe")
+	}
+	if rec.State != member.StateAlive {
+		t.Fatalf("T state = %v, want alive — indirect probe must suppress the false positive under SetDropRate 1.0", rec.State)
+	}
+}
+
+// TestNode_Delay_WithinRTT_NoSuspect: a moderate symmetric delay well under
+// RTTTimeout must be invisible to failure detection — the direct Ack simply
+// arrives a bit late, inside the window, and no indirect phase starts.
+func TestNode_Delay_WithinRTT_NoSuspect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const linkDelay = 20 * time.Millisecond
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	network.SetDelay("I", "T", linkDelay)
+	network.SetDelay("T", "I", linkDelay)
+
+	listI := fullList("I", "I", "T")
+	listT := fullList("T", "I", "T")
+
+	// RTTTimeout is generous versus the 2*linkDelay round trip so the elapsed
+	// checks below have margin and never flake on a loaded machine.
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: time.Second}
+	cfgI := cfg
+	cfgI.Rand = rand.New(rand.NewSource(1))
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeT := NewNode(listT, trT, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopT := startNode(t, nodeT)
+	defer stopT()
+
+	start := time.Now()
+	nodeI.probeOnce(ctx)
+	elapsed := time.Since(start)
+
+	// The Ack crossed two delayed hops, so it cannot have returned faster than
+	// the round trip — this proves the delay was actually in the packet's path.
+	if elapsed < 2*linkDelay {
+		t.Fatalf("probeOnce returned in %v, want >= %v — the Ack cannot beat the round-trip link delay", elapsed, 2*linkDelay)
+	}
+	// And it returned far inside RTTTimeout: the probe closed on the direct
+	// Ack, no timeout was burned (same discrimination as the PingAck test).
+	if elapsed >= cfg.RTTTimeout/2 {
+		t.Fatalf("probeOnce took %v (RTTTimeout %v) — looks like the delayed Ack missed the direct window", elapsed, cfg.RTTTimeout)
+	}
+
+	rec, ok := listI.Get("T")
+	if !ok {
+		t.Fatal("T missing from listI after probe")
+	}
+	if rec.State != member.StateAlive {
+		t.Errorf("T state = %v, want alive — a delay within RTTTimeout must not trigger suspicion", rec.State)
+	}
+}
+
+// TestNode_Delay_ExceedsRTT_IndirectRescues: the direct link is not lossy but
+// SLOW — the Ping reaches T only after RTTTimeout has long expired. The fast
+// relay path through M must rescue T exactly as it does under loss. Asserting
+// elapsed < the direct-link delay proves the probe was closed by the relay:
+// the delayed direct Ack physically cannot arrive before `directDelay`.
+func TestNode_Delay_ExceedsRTT_IndirectRescues(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const directDelay = 400 * time.Millisecond
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	// Only I->T is slow; every link through M is immediate.
+	network.SetDelay("I", "T", directDelay)
+
+	listI := fullList("I", "I", "M", "T")
+	listM := fullList("M", "I", "M", "T")
+	listT := fullList("T", "I", "M", "T")
+
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: 100 * time.Millisecond, IndirectTimeout: 2 * time.Second}
+	cfgI := cfg
+	cfgI.Rand = rand.New(rand.NewSource(1)) // Intn(2) == 1 selects T from [M, T]
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeM := NewNode(listM, trM, cfg)
+	nodeT := NewNode(listT, trT, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopM := startNode(t, nodeM)
+	defer stopM()
+	stopT := startNode(t, nodeT)
+	defer stopT()
+
+	start := time.Now()
+	nodeI.probeOnce(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed < cfg.RTTTimeout/2 {
+		t.Fatalf("probeOnce returned in %v (RTTTimeout %v) — direct ping got answered in time, so the probe target was not T", elapsed, cfg.RTTTimeout)
+	}
+	if elapsed >= directDelay {
+		t.Fatalf("probeOnce took %v (direct-link delay %v) — the probe must close on M's fast relay, not on the late direct Ack", elapsed, directDelay)
+	}
+
+	rec, ok := listI.Get("T")
+	if !ok {
+		t.Fatal("T missing from listI after probe")
+	}
+	if rec.State != member.StateAlive {
+		t.Fatalf("T state = %v, want alive — the fast indirect path must rescue a slow direct link", rec.State)
+	}
+}
+
+// TestNode_Partition_MarksSuspect is the negative counterpart of the rescue
+// tests: T sits on the far side of a real partition, so neither the direct
+// Ping nor M's indirect one can cross — a genuinely unreachable node MUST end
+// up Suspect. Short timeouts are safe: every wait is a true timeout, nothing
+// has to beat a deadline (same reasoning as
+// TestNode_IndirectProbe_AllFail_MarksSuspect).
+func TestNode_Partition_MarksSuspect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	// T alone on one side; I and M stay in the default group 0, so both the
+	// direct Ping and the mediated one die at the boundary.
+	network.Partition(1, "T")
+
+	listI := fullList("I", "I", "M", "T")
+	listM := fullList("M", "I", "M", "T")
+	listT := fullList("T", "I", "M", "T")
+
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: 50 * time.Millisecond, IndirectTimeout: 150 * time.Millisecond}
+	cfgI := cfg
+	cfgI.Rand = rand.New(rand.NewSource(1)) // Intn(2) == 1 selects T from [M, T]
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeM := NewNode(listM, trM, cfg)
+	nodeT := NewNode(listT, trT, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopM := startNode(t, nodeM)
+	defer stopM()
+	stopT := startNode(t, nodeT)
+	defer stopT()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nodeI.probeOnce(ctx)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("probeOnce hung past both probe phases")
+	}
+
+	rec, ok := listI.Get("T")
+	if !ok {
+		t.Fatal("T missing from listI after probe")
+	}
+	if rec.State != member.StateSuspect {
+		t.Errorf("T state = %v, want suspect — a genuinely partitioned node must be suspected", rec.State)
+	}
+}
+
 // TestNode_DeadEscalation_SpreadsViaGossip closes the end-to-end loop: once
 // this node escalates B to Dead on its own, the verdict must ride the next
 // outbound gossip batch and a neighbor absorbing that exact batch must
