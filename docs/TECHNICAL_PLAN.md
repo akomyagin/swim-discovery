@@ -50,21 +50,30 @@ cmd/swim-discovery/ main.go        тонкий CLI: флаги, запуск у
 телах, CLI-заглушка. Compile-time assertion `var _ Transport = (*UDP)(nil)`.
 `go build ./...` и `go vet ./...` проходят чисто.
 
-### Этап 1 — Модель узла + membership-список + direct ping/ack (UDP, localhost)
+### Этап 1 — Модель узла + membership-список + direct ping/ack (UDP, localhost) (готов)
 
 - `member.List`: `map[member.ID]*Member` под `sync.RWMutex`, seed локальным
   узлом; `Merge` реализует **precedence по (Incarnation, State)**: выше
   incarnation всегда побеждает; при равной incarnation `Dead > Suspect > Alive`;
   возвращает `changed` для будущего re-gossip.
 - `transport.UDP`: `net.ListenUDP`, `Send` через `WriteToUDP`, receive-loop над
-  `ReadFromUDP` → канал `Packet`.
+  `ReadFromUDP` → канал `Packet`. Плюс `transport.Fake`/`FakeNetwork` —
+  минимальный in-memory роутер без потерь для юнит-тестов (полноценный
+  симулятор с drop/delay — по-прежнему Этап 5, дорастает из этого же файла).
 - `protocol.Encode/Decode`: JSON, пока только `KindPing`/`KindAck` (без Updates).
-- `internal/swim`: probe-loop — раз в интервал выбрать случайного члена, послать
-  Ping, ждать Ack в пределах RTT-таймаута; при Ack — подтвердить alive.
-- CLI: два+ процесса на разных портах, `--seed` для присоединения.
+- `internal/swim`: `Node`/`Config` с инжектируемым `*rand.Rand` (введён уже в
+  Этапе 1 — нужен детерминированный выбор цели пробы и переиспользуется в
+  Этапе 3 для K посредников); probe-loop раз в интервал выбирает случайного
+  члена, шлёт Ping, ждёт Ack в пределах RTT-таймаута (`context.WithTimeout`);
+  при Ack — подтверждает alive, при таймауте в Этапе 1 не делает ничего
+  (Suspect/PingReq — будущие этапы).
+- CLI: два+ процесса на разных портах, `--seed` для присоединения (сид сразу
+  заносится в список как alive-член, чтобы probe заработал в обе стороны).
 - Тесты: merge-precedence (table-driven), round-trip Encode/Decode, ping/ack
-  над **fake-транспортом без потерь** (полноценный симулятор — Этап 5, но
-  минимальный in-memory transport для юнит-тестов заводим уже здесь).
+  над fake-транспортом без потерь; всё под `-race`.
+
+Живой прогон подтверждён на реальном UDP (localhost) и независимым ревью
+(8 углов + верификация находок).
 
 ### Этап 2 — Gossip-рассылка дельт членства (piggyback)
 

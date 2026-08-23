@@ -11,7 +11,11 @@
 //     membership-list level (see internal/protocol for the wire messages).
 package member
 
-import "time"
+import (
+	"sort"
+	"sync"
+	"time"
+)
 
 // State is the SWIM lifecycle state of a node as seen by a peer.
 type State uint8
@@ -58,37 +62,107 @@ type Member struct {
 	StateChangedAt time.Time
 }
 
-// List is a node's local, eventually-consistent view of the cluster.
-//
-// TODO(Этап 1): implement. Backing store (map[ID]*Member) + mutex, plus the
-// merge rule that reconciles an incoming rumor against the local record using
-// (Incarnation, State) precedence: higher incarnation always wins; at equal
-// incarnation, Dead > Suspect > Alive.
+// List is a node's local, eventually-consistent view of the cluster. It
+// reconciles incoming rumors against local records using (Incarnation, State)
+// precedence: higher incarnation always wins; at equal incarnation,
+// Dead > Suspect > Alive.
 type List struct {
-	// TODO(Этап 1): self ID, map[ID]*Member, sync.RWMutex.
+	self    ID
+	mu      sync.RWMutex
+	members map[ID]*Member
 }
 
-// NewList creates an empty membership list seeded with the local node.
-//
-// TODO(Этап 1): implement.
+// NewList creates a membership list seeded with the local node.
 func NewList(self Member) *List {
-	_ = self
-	panic("TODO(Этап 1): NewList not implemented")
+	l := &List{
+		self:    self.ID,
+		members: map[ID]*Member{},
+	}
+	// Store a private copy so callers cannot mutate the record past the mutex.
+	cp := self
+	l.members[self.ID] = &cp
+	return l
+}
+
+// stateRank orders states for equal-incarnation conflicts: the "worse" state
+// wins so that a suspicion/death rumor cannot be silently shadowed by a stale
+// alive record — only a higher incarnation (refute) overrides it.
+func stateRank(s State) int {
+	switch s {
+	case StateSuspect:
+		return 1
+	case StateDead:
+		return 2
+	default:
+		return 0
+	}
 }
 
 // Merge reconciles an incoming view of a member into the local list, applying
 // the (Incarnation, State) precedence rule. Returns true if the local view
 // changed (and therefore should be re-gossiped).
 //
-// TODO(Этап 1): implement precedence; TODO(Этап 2): feed changes into gossip.
+// TODO(Этап 2): feed changes into gossip.
 func (l *List) Merge(m Member) (changed bool) {
-	_ = m
-	panic("TODO(Этап 1): Merge not implemented")
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	cur, ok := l.members[m.ID]
+	if ok {
+		switch {
+		case m.Incarnation > cur.Incarnation:
+			// incoming wins
+		case m.Incarnation < cur.Incarnation:
+			return false
+		default:
+			if stateRank(m.State) <= stateRank(cur.State) {
+				return false
+			}
+		}
+	}
+
+	cp := m
+	if cp.StateChangedAt.IsZero() && (!ok || cur.State != m.State) {
+		// Transition without an explicit timestamp from the rumor — covers
+		// both a local state change and a first-ever insert (which is a
+		// transition from "unknown" to whatever state the rumor carries).
+		// Stamp now so Этап 4 suspicion timeouts have a starting point.
+		cp.StateChangedAt = time.Now()
+	}
+	l.members[m.ID] = &cp
+	return true
 }
 
-// Members returns a snapshot of the current view for the CLI / probing.
-//
-// TODO(Этап 1): implement.
+// Members returns a sorted snapshot of the current view for the CLI / probing.
 func (l *List) Members() []Member {
-	panic("TODO(Этап 1): Members not implemented")
+	return l.snapshot(false)
+}
+
+// Self returns this node's own ID.
+func (l *List) Self() ID {
+	return l.self
+}
+
+// Others returns a snapshot of all members except self (any state), sorted by
+// ID. Probing must target peers, never self, so the filter lives here rather
+// than being repeated in the swim core.
+func (l *List) Others() []Member {
+	return l.snapshot(true)
+}
+
+// snapshot copies the current view, optionally excluding self, sorted by ID
+// for deterministic tests and stable CLI output.
+func (l *List) snapshot(skipSelf bool) []Member {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	out := make([]Member, 0, len(l.members))
+	for id, m := range l.members {
+		if skipSelf && id == l.self {
+			continue
+		}
+		out = append(out, *m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
