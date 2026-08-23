@@ -156,6 +156,30 @@ func TestNewList_SeedsSelf(t *testing.T) {
 	}
 }
 
+func TestList_Get_ReturnsCopy(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", Incarnation: 5, State: StateAlive})
+
+	got, ok := l.Get("A")
+	if !ok {
+		t.Fatal("Get(self) reported unknown")
+	}
+	if got.Incarnation != 5 || got.State != StateAlive {
+		t.Errorf("Get(A) = %+v, want alive@5", got)
+	}
+
+	// Mutating the returned value must not leak past the mutex into the list.
+	got.State = StateDead
+	got.Incarnation = 99
+	again, _ := l.Get("A")
+	if again.State != StateAlive || again.Incarnation != 5 {
+		t.Errorf("list record changed through Get's return value: %+v", again)
+	}
+
+	if _, ok := l.Get("nobody"); ok {
+		t.Error("Get of an unknown ID reported known")
+	}
+}
+
 func TestList_Others_ExcludesSelf(t *testing.T) {
 	l := NewList(Member{ID: "B", Addr: "B", State: StateAlive})
 	l.Merge(Member{ID: "C", Addr: "C", State: StateAlive})

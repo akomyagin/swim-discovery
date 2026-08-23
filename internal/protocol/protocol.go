@@ -32,6 +32,12 @@ const (
 )
 
 // Update is one gossiped membership fact piggybacked on any message.
+//
+// Deliberately NO timestamp rides on the wire: per SWIM, suspicion timing is
+// local to every observer — each node arms its own timer from the moment it
+// first saw the Suspect — so a shared timestamp would add nothing except
+// trust in unauthenticated remote clocks. Member.StateChangedAt is therefore
+// a local-only diagnostic, never a protocol field (Этап 4 decision).
 type Update struct {
 	ID          member.ID    `json:"id"`
 	Addr        string       `json:"addr"`

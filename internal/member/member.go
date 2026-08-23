@@ -58,8 +58,13 @@ type Member struct {
 	// with a lower incarnation than what we know is ignored.
 	Incarnation uint64
 	State       State
-	// StateChangedAt marks when State last transitioned; drives the suspicion
-	// timeout in Этап 4.
+	// StateChangedAt marks when THIS node's local view saw State transition.
+	// It is stamped locally and deliberately never transmitted: per SWIM,
+	// suspicion timing is each observer's own concern — every node runs its own
+	// timer from the moment it first saw the Suspect — so shipping wall-clock
+	// timestamps would only add trust in unauthenticated remote clocks (see
+	// protocol.Update). The field serves diagnostics/CLI; the authoritative
+	// suspicion deadline is the timer inside swim.Node, not this value.
 	StateChangedAt time.Time
 }
 
@@ -150,7 +155,11 @@ func (l *List) Merge(m Member) (changed bool) {
 		// Transition without an explicit timestamp from the rumor — covers
 		// both a local state change and a first-ever insert (which is a
 		// transition from "unknown" to whatever state the rumor carries).
-		// Stamp now so Этап 4 suspicion timeouts have a starting point.
+		// The local re-stamp is deliberate SWIM semantics, not a lossy
+		// projection: rumors carry no timestamps on the wire, and each node
+		// times its own suspicion from when IT saw the transition (see
+		// Member.StateChangedAt). Diagnostics only — the suspicion deadline
+		// itself lives in swim.Node's Clock-driven timer.
 		cp.StateChangedAt = time.Now()
 	}
 	l.members[m.ID] = &cp
@@ -220,6 +229,21 @@ func (l *List) Members() []Member {
 // Self returns this node's own ID.
 func (l *List) Self() ID {
 	return l.self
+}
+
+// Get returns a copy of the record for id and whether it is known. Returning
+// a copy keeps the "callers cannot mutate past the mutex" invariant (see
+// NewList). Its primary consumer is refute (Этап 4): the swim layer reads its
+// own current incarnation before bumping it in response to a Suspect/Dead
+// rumor about itself.
+func (l *List) Get(id ID) (Member, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	m, ok := l.members[id]
+	if !ok {
+		return Member{}, false
+	}
+	return *m, true
 }
 
 // Others returns a snapshot of all members except self (any state), sorted by
