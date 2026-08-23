@@ -1,7 +1,9 @@
 // Package swim implements the SWIM protocol cycles. Этап 1 covers the direct
 // probe loop: every ProbeInterval pick one random peer, send a Ping, and
-// confirm it alive when the matching Ack arrives. Indirect probing (Этап 3)
-// and suspicion timeouts (Этап 4) build on top of this loop.
+// confirm it alive when the matching Ack arrives. Этап 2 piggybacks gossip on
+// that same traffic: every outbound Ping/Ack carries a batch of membership
+// updates, and every inbound message's batch is merged into the local view.
+// Indirect probing (Этап 3) and suspicion timeouts (Этап 4) build on top.
 package swim
 
 import (
@@ -15,6 +17,11 @@ import (
 	"github.com/akomyagin/swim-discovery/internal/protocol"
 	"github.com/akomyagin/swim-discovery/internal/transport"
 )
+
+// GossipMaxUpdates caps how many membership updates ride on one message, so a
+// single datagram stays small and no gossip storm forms. Learning-grade fixed
+// value; JSON+UDP on localhost comfortably fits this many Updates.
+const GossipMaxUpdates = 6
 
 // Config holds probe-loop timing and randomness. Time stays system-driven in
 // Этап 1 (context deadlines only); a Clock abstraction arrives in Этап 4.
@@ -75,6 +82,62 @@ func (n *Node) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// toUpdate projects a membership record onto the wire form. It lives in swim
+// (not protocol/member) because only this package imports both sides.
+func toUpdate(m member.Member) protocol.Update {
+	return protocol.Update{
+		ID:          m.ID,
+		Addr:        m.Addr,
+		Incarnation: m.Incarnation,
+		State:       m.State,
+	}
+}
+
+// fromUpdate is toUpdate's inverse: it projects a wire-form rumor back onto a
+// membership record for Merge. Kept symmetric with toUpdate so a future field
+// added to Update/Member only needs updating in one matched pair.
+func fromUpdate(u protocol.Update) member.Member {
+	return member.Member{
+		ID:          u.ID,
+		Addr:        u.Addr,
+		Incarnation: u.Incarnation,
+		State:       u.State,
+	}
+}
+
+// collectGossip pulls the next outbound batch from the list and projects it.
+// exclude (may be nil) skips records the receiving peer is already known to
+// have — see PendingGossip's doc for why that matters.
+func (n *Node) collectGossip(exclude map[member.ID]bool) []protocol.Update {
+	pending := n.list.PendingGossip(GossipMaxUpdates, exclude)
+	if len(pending) == 0 {
+		return nil // omitempty keeps the wire clean
+	}
+	ups := make([]protocol.Update, 0, len(pending))
+	for _, m := range pending {
+		ups = append(ups, toUpdate(m))
+	}
+	return ups
+}
+
+// applyGossip merges every piggybacked update into the local view and reports
+// which IDs it saw, so the caller can avoid echoing them straight back to the
+// peer that just supplied them. Records that change get re-queued for gossip
+// automatically inside List.Merge — that implicit re-queue is the epidemic:
+// an absorbed rumor becomes a candidate for the next outbound message without
+// any explicit forwarding step here.
+func (n *Node) applyGossip(ups []protocol.Update) map[member.ID]bool {
+	if len(ups) == 0 {
+		return nil
+	}
+	seen := make(map[member.ID]bool, len(ups))
+	for _, u := range ups {
+		n.list.Merge(fromUpdate(u))
+		seen[u.ID] = true
+	}
+	return seen
+}
+
 func (n *Node) receiveLoop(ctx context.Context) {
 	for {
 		pkt, err := n.tr.Receive(ctx)
@@ -89,14 +152,20 @@ func (n *Node) receiveLoop(ctx context.Context) {
 			log.Printf("swim: dropping undecodable packet from %s: %v", pkt.Addr, err)
 			continue
 		}
+		// Absorb piggybacked rumors before dispatching on Kind, so a change
+		// carried by this very message can ride back on the Ack we send below.
+		seen := n.applyGossip(msg.Updates)
 		switch msg.Kind {
 		case protocol.KindPing:
-			// Echo SeqNo so the sender can correlate. Updates stay empty
-			// until gossip lands in Этап 2.
+			// Echo SeqNo so the sender can correlate; attach the next gossip
+			// batch so the reply also spreads rumors. Exclude records this
+			// same message just supplied — the sender already has them, so
+			// echoing them back is a guaranteed-wasted retransmission.
 			ack := protocol.Message{
-				Kind:  protocol.KindAck,
-				From:  n.list.Self(),
-				SeqNo: msg.SeqNo,
+				Kind:    protocol.KindAck,
+				From:    n.list.Self(),
+				SeqNo:   msg.SeqNo,
+				Updates: n.collectGossip(seen),
 			}
 			payload, err := protocol.Encode(ack)
 			if err != nil {
@@ -120,6 +189,8 @@ func (n *Node) receiveLoop(ctx context.Context) {
 			}
 		case protocol.KindPingReq:
 			// Indirect probing is Этап 3; ignoring is the whole handling.
+			// Its Updates were still absorbed above — even an unhandled
+			// message may carry useful rumors.
 			log.Printf("swim: PingReq from %s ignored (not implemented until Этап 3)", msg.From)
 		}
 	}
@@ -160,9 +231,10 @@ func (n *Node) probeOnce(ctx context.Context) {
 	n.mu.Unlock()
 
 	msg := protocol.Message{
-		Kind:  protocol.KindPing,
-		From:  n.list.Self(),
-		SeqNo: seq,
+		Kind:    protocol.KindPing,
+		From:    n.list.Self(),
+		SeqNo:   seq,
+		Updates: n.collectGossip(nil),
 	}
 	payload, err := protocol.Encode(msg)
 	if err != nil {

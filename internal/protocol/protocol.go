@@ -52,9 +52,9 @@ type Message struct {
 	Updates []Update `json:"updates,omitempty"`
 }
 
-// Encode serializes a Message into a transport payload.
-//
-// TODO(Этап 2): include piggybacked Updates.
+// Encode serializes a Message into a transport payload as-is, including any
+// piggybacked Updates the caller has attached (the swim core fills them from
+// its gossip queue; Encode itself adds nothing).
 func Encode(m Message) ([]byte, error) {
 	return json.Marshal(m)
 }
