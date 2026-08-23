@@ -687,3 +687,393 @@ func TestCluster_GossipConvergence(t *testing.T) {
 	cancel()
 	wg.Wait()
 }
+
+// ---- Этап 4: suspicion timeouts and refute ------------------------------
+//
+// These tests drive the private suspect/applyGossip/escalate paths directly
+// under a fakeClock: Advance delivers timer firings synchronously, so every
+// assertion runs right after the virtual deadline with no time.Sleep and no
+// polling. No Node.Run is needed — nothing here depends on live loops.
+
+// drainGossip empties the list's outbound gossip queue so a later
+// PendingGossip call shows exactly what the scenario under test re-queued,
+// not join-time leftovers.
+func drainGossip(l *member.List) {
+	for len(l.PendingGossip(GossipMaxUpdates, nil)) > 0 {
+	}
+}
+
+// suspicionFixture is the shared setup: node A (fakeClock, 10s suspicion
+// window) that knows B alive at incarnation 4.
+func suspicionFixture(t *testing.T) (*Node, *member.List, *fakeClock) {
+	t.Helper()
+	clock := newFakeClock()
+	network := transport.NewFakeNetwork()
+	trA := network.Endpoint("A")
+	t.Cleanup(func() { trA.Close() })
+
+	listA := member.NewList(member.Member{ID: "A", Addr: "A", State: member.StateAlive})
+	listA.Merge(member.Member{ID: "B", Addr: "B", Incarnation: 4, State: member.StateAlive})
+	drainGossip(listA)
+
+	nodeA := NewNode(listA, trA, Config{
+		ProbeInterval:    time.Hour,
+		SuspicionTimeout: 10 * time.Second,
+		Clock:            clock,
+	})
+	return nodeA, listA, clock
+}
+
+func TestNode_SuspectEscalatesToDead_OnTimeout(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.suspect(member.Member{ID: "B", Addr: "B", Incarnation: 4})
+	if rec, ok := listA.Get("B"); !ok || rec.State != member.StateSuspect {
+		t.Fatalf("B = %+v (known=%v), want suspect right after suspect()", rec, ok)
+	}
+
+	// One tick short of the deadline: the timer must not fire early.
+	clock.Advance(10*time.Second - time.Millisecond)
+	if rec, _ := listA.Get("B"); rec.State != member.StateSuspect {
+		t.Fatalf("B state = %v just before the deadline, want still suspect", rec.State)
+	}
+
+	clock.Advance(time.Millisecond) // exactly SuspicionTimeout in total
+	rec, _ := listA.Get("B")
+	if rec.State != member.StateDead {
+		t.Fatalf("B state = %v after SuspicionTimeout, want dead", rec.State)
+	}
+	if rec.Incarnation != 4 {
+		t.Errorf("B incarnation = %d, want 4 — escalation must stay on the suspected incarnation", rec.Incarnation)
+	}
+
+	// The death must be queued for dissemination like any membership change.
+	foundDead := false
+	for _, m := range listA.PendingGossip(GossipMaxUpdates, nil) {
+		if m.ID == "B" && m.State == member.StateDead {
+			foundDead = true
+		}
+	}
+	if !foundDead {
+		t.Error("dead B not queued for gossip after escalation")
+	}
+}
+
+func TestNode_RefuteCancelsSuspicionTimer(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.suspect(member.Member{ID: "B", Addr: "B", Incarnation: 4})
+
+	// B's refute arrives as ordinary inbound gossip: Alive at a bumped
+	// incarnation. That must both flip the record and disarm the timer.
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 5, State: member.StateAlive},
+	})
+	if rec, _ := listA.Get("B"); rec.State != member.StateAlive || rec.Incarnation != 5 {
+		t.Fatalf("B = %v@%d after refute, want alive@5", rec.State, rec.Incarnation)
+	}
+
+	clock.Advance(20 * time.Second) // far past the old deadline
+	if rec, _ := listA.Get("B"); rec.State != member.StateAlive || rec.Incarnation != 5 {
+		t.Fatalf("B = %v@%d after Advance, want alive@5 — the refute must have cancelled the escalation", rec.State, rec.Incarnation)
+	}
+}
+
+// TestNode_StaleEscalationLosesToMergePrecedence covers the worst-case race:
+// the refute lands in the list WITHOUT passing through applyGossip's cancel
+// path, so the timer is still armed when it fires. The escalation goes
+// through Merge, and Merge rejects Dead@4 against Alive@5 — precedence, not
+// the timer, has the final word.
+func TestNode_StaleEscalationLosesToMergePrecedence(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.suspect(member.Member{ID: "B", Addr: "B", Incarnation: 4})
+	listA.Merge(member.Member{ID: "B", Addr: "B", Incarnation: 5, State: member.StateAlive})
+
+	clock.Advance(10 * time.Second) // the armed timer fires and escalates
+	if rec, _ := listA.Get("B"); rec.State != member.StateAlive || rec.Incarnation != 5 {
+		t.Fatalf("B = %v@%d, want alive@5 — a stale Dead@4 must lose in Merge", rec.State, rec.Incarnation)
+	}
+}
+
+// TestNode_GossipSuspectArmsLocalTimer: SWIM requires every node that HEARS a
+// Suspect rumor to run its own local timer — not just the original detector.
+// C arrives already suspect via gossip; without any probe of ours it must
+// still escalate to dead here once our local window expires.
+func TestNode_GossipSuspectArmsLocalTimer(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "C", Addr: "C", Incarnation: 2, State: member.StateSuspect},
+	})
+	if rec, ok := listA.Get("C"); !ok || rec.State != member.StateSuspect {
+		t.Fatalf("C = %+v (known=%v), want suspect after the rumor", rec, ok)
+	}
+
+	clock.Advance(10 * time.Second)
+	rec, _ := listA.Get("C")
+	if rec.State != member.StateDead || rec.Incarnation != 2 {
+		t.Fatalf("C = %v@%d after SuspicionTimeout, want dead@2 (rumor-armed timer)", rec.State, rec.Incarnation)
+	}
+}
+
+// TestNode_RefutesSuspectRumorAboutSelf is the wire-level refute test: X
+// slanders A to its face (a Ping piggybacking "A is suspect" at A's own
+// incarnation), and the very Ack answering that Ping must already carry A's
+// refutation — Alive at a bumped incarnation.
+func TestNode_RefutesSuspectRumorAboutSelf(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trA := network.Endpoint("A")
+	defer trA.Close()
+	trX := network.Endpoint("X")
+	defer trX.Close()
+
+	listA := member.NewList(member.Member{ID: "A", Addr: "A", State: member.StateAlive})
+	nodeA := NewNode(listA, trA, Config{ProbeInterval: time.Hour, RTTTimeout: time.Second})
+	stopA := startNode(t, nodeA)
+	defer stopA()
+
+	ping := protocol.Message{
+		Kind:  protocol.KindPing,
+		From:  "X",
+		SeqNo: 3,
+		Updates: []protocol.Update{
+			{ID: "A", Addr: "A", Incarnation: 0, State: member.StateSuspect},
+		},
+	}
+	payload, err := protocol.Encode(ping)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := trX.Send(ctx, "A", payload); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	pkt, err := trX.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	ack, err := protocol.Decode(pkt.Payload)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	// A's own record: alive, incarnation bumped past the rumor's.
+	rec, ok := listA.Get("A")
+	if !ok || rec.State != member.StateAlive || rec.Incarnation != 1 {
+		t.Fatalf("self record = %+v (known=%v), want alive@1 after refuting suspect@0", rec, ok)
+	}
+
+	// The refutation must ride back on this very Ack (self is deliberately
+	// not excluded as "seen": our record now differs from the rumor).
+	found := false
+	for _, u := range ack.Updates {
+		if u.ID == "A" {
+			found = true
+			if u.State != member.StateAlive || u.Incarnation != 1 {
+				t.Errorf("ack carries self as %v@%d, want alive@1", u.State, u.Incarnation)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("ack Updates = %+v, want the refutation (A alive@1) piggybacked", ack.Updates)
+	}
+}
+
+// TestNode_SelfRefuteIncarnationRules pins the anti-storm guard: only a
+// Suspect/Dead rumor at incarnation >= ours bumps the incarnation; stale
+// rumors and Alive mentions must not (unbounded escalation otherwise).
+func TestNode_SelfRefuteIncarnationRules(t *testing.T) {
+	cases := []struct {
+		name    string
+		rumor   protocol.Update
+		wantInc uint64
+	}{
+		{
+			name:    "suspect at own incarnation bumps past it",
+			rumor:   protocol.Update{ID: "A", Addr: "A", Incarnation: 5, State: member.StateSuspect},
+			wantInc: 6,
+		},
+		{
+			name:    "dead at higher incarnation bumps past the rumor",
+			rumor:   protocol.Update{ID: "A", Addr: "A", Incarnation: 7, State: member.StateDead},
+			wantInc: 8,
+		},
+		{
+			name:    "stale suspect is ignored",
+			rumor:   protocol.Update{ID: "A", Addr: "A", Incarnation: 3, State: member.StateSuspect},
+			wantInc: 5,
+		},
+		{
+			name:    "alive mention never bumps",
+			rumor:   protocol.Update{ID: "A", Addr: "A", Incarnation: 5, State: member.StateAlive},
+			wantInc: 5,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			network := transport.NewFakeNetwork()
+			trA := network.Endpoint("A")
+			defer trA.Close()
+			listA := member.NewList(member.Member{ID: "A", Addr: "A", Incarnation: 5, State: member.StateAlive})
+			nodeA := NewNode(listA, trA, Config{ProbeInterval: time.Hour})
+
+			nodeA.applyGossip([]protocol.Update{tc.rumor})
+
+			rec, _ := listA.Get("A")
+			if rec.State != member.StateAlive {
+				t.Errorf("self state = %v, want alive (a node never believes rumors of its own demise)", rec.State)
+			}
+			if rec.Incarnation != tc.wantInc {
+				t.Errorf("self incarnation = %d, want %d", rec.Incarnation, tc.wantInc)
+			}
+		})
+	}
+}
+
+// TestNode_SuspicionConcurrentArmCancel races suspicion arming (suspect)
+// against refutes (applyGossip) and a concurrently advancing clock, for many
+// targets at once. Run under -race this exercises the suspicions map and the
+// fakeClock for data races; semantically, whatever the interleaving, Merge
+// precedence guarantees the refuted state wins — even an escalation that
+// slips through fires Dead@1 and loses to Alive@2.
+func TestNode_SuspicionConcurrentArmCancel(t *testing.T) {
+	clock := newFakeClock()
+	network := transport.NewFakeNetwork()
+	trA := network.Endpoint("A")
+	defer trA.Close()
+
+	listA := member.NewList(member.Member{ID: "A", Addr: "A", State: member.StateAlive})
+	const peers = 8
+	ids := make([]member.ID, peers)
+	for i := 0; i < peers; i++ {
+		ids[i] = member.ID("B" + string(rune('0'+i)))
+		listA.Merge(member.Member{ID: ids[i], Addr: string(ids[i]), Incarnation: 1, State: member.StateAlive})
+	}
+	nodeA := NewNode(listA, trA, Config{
+		ProbeInterval:    time.Hour,
+		SuspicionTimeout: 10 * time.Second,
+		Clock:            clock,
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < peers; i++ {
+		id := ids[i]
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			nodeA.suspect(member.Member{ID: id, Addr: string(id), Incarnation: 1})
+		}()
+		go func() {
+			defer wg.Done()
+			nodeA.applyGossip([]protocol.Update{
+				{ID: id, Addr: string(id), Incarnation: 2, State: member.StateAlive},
+			})
+		}()
+	}
+	wg.Add(1)
+	go func() { // time moves while timers are being armed and cancelled
+		defer wg.Done()
+		for k := 0; k < 5; k++ {
+			clock.Advance(3 * time.Second)
+		}
+	}()
+	wg.Wait()
+	clock.Advance(20 * time.Second) // fire anything still armed
+
+	for _, id := range ids {
+		rec, _ := listA.Get(id)
+		if rec.State != member.StateAlive || rec.Incarnation != 2 {
+			t.Errorf("%s = %v@%d, want alive@2 in every interleaving", id, rec.State, rec.Incarnation)
+		}
+	}
+}
+
+// TestNode_RefuteAfterDeadEscalation_Recovers: a refute is not "too late" —
+// Merge precedence has no notion of it. Even after this node already
+// escalated B to Dead on its own, a higher-incarnation Alive rumor arriving
+// afterwards must still resurrect B, same as if it had arrived before.
+func TestNode_RefuteAfterDeadEscalation_Recovers(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.suspect(member.Member{ID: "B", Addr: "B", Incarnation: 4})
+	clock.Advance(10 * time.Second) // escalates to dead
+	if rec, _ := listA.Get("B"); rec.State != member.StateDead {
+		t.Fatalf("B state = %v before refute, want dead (test setup)", rec.State)
+	}
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 5, State: member.StateAlive},
+	})
+	rec, _ := listA.Get("B")
+	if rec.State != member.StateAlive || rec.Incarnation != 5 {
+		t.Fatalf("B = %v@%d after post-mortem refute, want alive@5", rec.State, rec.Incarnation)
+	}
+}
+
+// TestNode_SuspectAtHigherIncarnation_RestartsTimer: a fresh Suspect rumor at
+// a HIGHER incarnation than the one currently armed must replace the timer
+// and get its own full SuspicionTimeout window — not inherit however much of
+// the old window had already elapsed.
+func TestNode_SuspectAtHigherIncarnation_RestartsTimer(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "C", Addr: "C", Incarnation: 2, State: member.StateSuspect},
+	})
+	clock.Advance(6 * time.Second) // well past halfway to the @2 timer's 10s deadline
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "C", Addr: "C", Incarnation: 3, State: member.StateSuspect},
+	})
+	clock.Advance(6 * time.Second) // 12s since @2 armed, but only 6s since @3 replaced it
+	if rec, _ := listA.Get("C"); rec.State != member.StateSuspect {
+		t.Fatalf("C state = %v 6s into the @3 window, want still suspect (fresh window, not inherited)", rec.State)
+	}
+
+	clock.Advance(4 * time.Second) // completes the @3 timer's own 10s
+	rec, _ := listA.Get("C")
+	if rec.State != member.StateDead || rec.Incarnation != 3 {
+		t.Fatalf("C = %v@%d after the @3 window elapsed, want dead@3", rec.State, rec.Incarnation)
+	}
+}
+
+// TestNode_DeadEscalation_SpreadsViaGossip closes the end-to-end loop: once
+// this node escalates B to Dead on its own, the verdict must ride the next
+// outbound gossip batch and a neighbor absorbing that exact batch must
+// independently converge to the same Dead view — the failure detector is
+// useless if the verdict stays local.
+func TestNode_DeadEscalation_SpreadsViaGossip(t *testing.T) {
+	nodeA, listA, clock := suspicionFixture(t)
+
+	nodeA.suspect(member.Member{ID: "B", Addr: "B", Incarnation: 4})
+	clock.Advance(10 * time.Second) // escalates locally
+	if rec, _ := listA.Get("B"); rec.State != member.StateDead {
+		t.Fatalf("B state = %v after Advance, want dead (test setup)", rec.State)
+	}
+
+	ups := nodeA.collectGossip(nil)
+	found := false
+	for _, u := range ups {
+		if u.ID == "B" && u.State == member.StateDead {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("collectGossip after escalation = %+v, want B dead@4 piggybacked", ups)
+	}
+
+	network := transport.NewFakeNetwork()
+	trC := network.Endpoint("C")
+	defer trC.Close()
+	listC := member.NewList(member.Member{ID: "C", Addr: "C", State: member.StateAlive})
+	nodeC := NewNode(listC, trC, Config{ProbeInterval: time.Hour})
+
+	nodeC.applyGossip(ups)
+	rec, ok := listC.Get("B")
+	if !ok || rec.State != member.StateDead {
+		t.Fatalf("neighbor C's view of B = %+v (known=%v), want dead after absorbing the gossip batch", rec, ok)
+	}
+}

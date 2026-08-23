@@ -6,7 +6,11 @@
 // Этап 3 adds indirect probing: when the direct Ping stays unanswered, K
 // mediators are asked (PingReq) to ping the target on our behalf and relay its
 // Ack; only full silence — direct and every indirect — demotes the target to
-// Suspect. Suspicion timeouts that escalate Suspect to Dead are Этап 4.
+// Suspect. Этап 4 closes the failure-detection loop: a Suspect that goes
+// unrefuted for SuspicionTimeout is escalated to Dead, and a node that hears
+// a Suspect/Dead rumor about ITSELF refutes it by bumping its incarnation.
+// All probe/suspicion timing goes through an injectable Clock so tests drive
+// it deterministically.
 package swim
 
 import (
@@ -26,8 +30,38 @@ import (
 // value; JSON+UDP on localhost comfortably fits this many Updates.
 const GossipMaxUpdates = 6
 
-// Config holds probe-loop timing and randomness. Time stays system-driven
-// (context deadlines only); a Clock abstraction arrives in Этап 4.
+// Clock abstracts time for every probe/suspicion timeout in this package, so
+// tests can drive deadlines deterministically (fakeClock.Advance) instead of
+// sleeping on real timers. Production uses systemClock.
+type Clock interface {
+	// Now returns the current time. Stamps and diagnostics only — protocol
+	// decisions use the relative mechanisms below, never wall-clock compares.
+	Now() time.Time
+	// After returns a channel that receives the time once d has elapsed.
+	// Used for in-line waits (Ack timeouts in waitAck).
+	After(d time.Duration) <-chan time.Time
+	// AfterFunc schedules f to run once d has elapsed and returns a handle
+	// that can cancel it. Used for suspicion timers.
+	AfterFunc(d time.Duration, f func()) Timer
+}
+
+// Timer is a cancellable pending AfterFunc. Stop reports whether it prevented
+// the callback from running (false: already fired or already stopped) — the
+// same contract as time.Timer.Stop.
+type Timer interface {
+	Stop() bool
+}
+
+// systemClock is the production Clock: thin proxies over package time.
+type systemClock struct{}
+
+func (systemClock) Now() time.Time                            { return time.Now() }
+func (systemClock) After(d time.Duration) <-chan time.Time    { return time.After(d) }
+func (systemClock) AfterFunc(d time.Duration, f func()) Timer { return time.AfterFunc(d, f) }
+
+var _ Clock = systemClock{} // compile-time contract, mirrors the transport adapters
+
+// Config holds probe/suspicion timing and randomness.
 type Config struct {
 	ProbeInterval time.Duration // how often to probe one random peer
 	RTTTimeout    time.Duration // how long to wait for a direct Ack
@@ -37,6 +71,15 @@ type Config struct {
 	// IndirectTimeout bounds how long probeOnce waits for ANY relayed Ack after
 	// fanning out PingReqs. Zero => production default (see NewNode).
 	IndirectTimeout time.Duration
+	// SuspicionTimeout is how long a Suspect may stay unrefuted before this
+	// node declares it Dead. Zero => production default (see NewNode). Project
+	// invariant: RTTTimeout, IndirectTimeout << SuspicionTimeout, so the
+	// indirect-probing rescue (Этап 3) always gets to finish long before the
+	// suspicion deadline can possibly fire.
+	SuspicionTimeout time.Duration
+	// Clock drives every probe/suspicion timeout. Nil => systemClock; tests
+	// inject fakeClock to advance time deterministically.
+	Clock Clock
 	// Rand is the injectable RNG for peer/mediator selection: tests seed it so
 	// the probed target is deterministic instead of global-rand luck.
 	Rand *rand.Rand
@@ -44,9 +87,10 @@ type Config struct {
 
 // Node runs the SWIM cycles for one cluster member over a Transport.
 type Node struct {
-	list *member.List
-	tr   transport.Transport
-	cfg  Config
+	list  *member.List
+	tr    transport.Transport
+	cfg   Config
+	clock Clock // cached cfg.Clock: every timeout in this package goes through it
 
 	mu    sync.Mutex
 	seqNo uint64 // monotonically increasing; correlates Ping/PingReq with Ack
@@ -57,6 +101,22 @@ type Node struct {
 	// and the indirect phase — and deletes it exactly once at the end; the
 	// receive loop never deletes (see the KindAck case for why).
 	pending map[uint64]chan struct{}
+
+	// suspicions holds the armed Suspect→Dead escalation timers, one per
+	// target, each valid only for the incarnation it was armed at. Guarded by
+	// its own mutex rather than n.mu so timer bookkeeping never extends the
+	// hot seqNo/pending/Rand critical section (and so escalation callbacks —
+	// which fire from Clock goroutines — contend only with each other).
+	suspMu     sync.Mutex
+	suspicions map[member.ID]*suspicionTimer
+}
+
+// suspicionTimer is one armed Suspect→Dead escalation, valid only for the
+// incarnation the target was suspected at: any information at a higher
+// incarnation (a refute above all) obsoletes and cancels it.
+type suspicionTimer struct {
+	incarnation uint64
+	timer       Timer
 }
 
 // NewNode assembles a node. Zero Config fields get production defaults; a nil
@@ -82,17 +142,34 @@ func NewNode(list *member.List, tr transport.Transport, cfg Config) *Node {
 		// separate knob so tests can narrow the window independently.
 		cfg.IndirectTimeout = cfg.RTTTimeout
 	}
+	if cfg.SuspicionTimeout == 0 {
+		// Deliberately orders of magnitude above RTTTimeout+IndirectTimeout
+		// (seconds vs hundreds of ms): the indirect-probing rescue must always
+		// finish long before a suspicion can escalate, or the project's central
+		// invariant (packet loss to a live node must not kill it) breaks.
+		cfg.SuspicionTimeout = 5 * time.Second
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = systemClock{}
+	}
 	return &Node{
-		list:    list,
-		tr:      tr,
-		cfg:     cfg,
-		pending: map[uint64]chan struct{}{},
+		list:       list,
+		tr:         tr,
+		cfg:        cfg,
+		clock:      cfg.Clock,
+		pending:    map[uint64]chan struct{}{},
+		suspicions: map[member.ID]*suspicionTimer{},
 	}
 }
 
 // Run starts the receive and probe loops and blocks until ctx is cancelled and
 // every mediator goroutine handlePingReq spawned along the way has returned.
+// On the way out it disarms every pending suspicion timer, so no escalation
+// outlives the node's ctx (an AfterFunc callback already in flight at that
+// exact moment is harmless: it only touches the mutex-guarded suspicions map
+// and List, both of which outlive Run).
 func (n *Node) Run(ctx context.Context) {
+	defer n.stopSuspicionTimers()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -108,6 +185,9 @@ func (n *Node) Run(ctx context.Context) {
 
 // toUpdate projects a membership record onto the wire form. It lives in swim
 // (not protocol/member) because only this package imports both sides.
+// StateChangedAt is deliberately NOT projected: suspicion timing is each
+// observer's local concern (every node arms its own timer from when IT saw
+// the Suspect), so the wire stays timestamp-free — see protocol.Update.
 func toUpdate(m member.Member) protocol.Update {
 	return protocol.Update{
 		ID:          m.ID,
@@ -150,16 +230,70 @@ func (n *Node) collectGossip(exclude map[member.ID]bool) []protocol.Update {
 // automatically inside List.Merge — that implicit re-queue is the epidemic:
 // an absorbed rumor becomes a candidate for the next outbound message without
 // any explicit forwarding step here.
+//
+// Этап 4 adds two side channels. A Suspect/Dead rumor about SELF triggers
+// refute (maybeRefute); self is then deliberately NOT marked seen — after a
+// refute our record differs from what the peer sent, and suppressing it from
+// the reply would delay spreading the correction on the very Ack answering
+// the slur. For everyone else, a freshly-absorbed Suspect arms this node's
+// own local suspicion timer (SWIM: every node that hears a Suspect times it
+// independently), and fresh Alive/Dead information cancels an obsolete one.
 func (n *Node) applyGossip(ups []protocol.Update) map[member.ID]bool {
 	if len(ups) == 0 {
 		return nil
 	}
+	self := n.list.Self()
 	seen := make(map[member.ID]bool, len(ups))
 	for _, u := range ups {
-		n.list.Merge(fromUpdate(u))
+		if u.ID == self {
+			// We are the authority on ourselves: never merge rumors about
+			// self, only refute the bad ones.
+			n.maybeRefute(u)
+			continue
+		}
+		m := fromUpdate(u)
+		changed := n.list.Merge(m)
 		seen[u.ID] = true
+		if !changed {
+			continue // rejected by precedence: must neither arm nor cancel
+		}
+		switch u.State {
+		case member.StateSuspect:
+			n.armSuspicion(m)
+		case member.StateAlive, member.StateDead:
+			n.cancelSuspicion(u.ID, u.Incarnation, u.State)
+		}
 	}
 	return seen
+}
+
+// maybeRefute answers a Suspect/Dead rumor about self: bump our incarnation
+// past the rumor's and re-announce ourselves Alive — by Merge precedence the
+// higher incarnation vanquishes the rumor everywhere it has spread (the
+// re-queue inside Merge puts the refutation on the next outbound piggyback;
+// the epidemic does the rest, no dedicated broadcast needed).
+//
+// Anti-storm guard: only a rumor at incarnation >= ours triggers a bump. A
+// stale rumor (lower incarnation) already loses in everyone's Merge, and
+// bumping on it — or on harmless Alive mentions — would escalate incarnation
+// numbers without bound.
+func (n *Node) maybeRefute(u protocol.Update) {
+	if u.State == member.StateAlive {
+		return
+	}
+	self, ok := n.list.Get(n.list.Self())
+	if !ok || u.Incarnation < self.Incarnation {
+		return
+	}
+	// u.Incarnation >= ours here, so +1 tops both the rumor and our record.
+	newInc := u.Incarnation + 1
+	log.Printf("swim: refuting %v rumor about self — alive at incarnation %d", u.State, newInc)
+	n.list.Merge(member.Member{
+		ID:          self.ID,
+		Addr:        self.Addr,
+		Incarnation: newInc,
+		State:       member.StateAlive,
+	})
 }
 
 // sendMessage encodes msg and sends it best-effort: failures are logged and
@@ -267,26 +401,11 @@ func (n *Node) handlePingReq(ctx context.Context, msg protocol.Message, initiato
 		return // unknown target: nobody to ping, stay silent
 	}
 
-	n.mu.Lock()
-	n.seqNo++
-	seq := n.seqNo
-	ackCh := make(chan struct{}, 1)
-	n.pending[seq] = ackCh
-	n.mu.Unlock()
-
-	n.sendMessage(ctx, target.Addr, protocol.Message{
-		Kind:    protocol.KindPing,
-		From:    n.list.Self(),
-		SeqNo:   seq,
-		Updates: n.collectGossip(nil),
-	})
-	ok := n.waitAck(ctx, ackCh, n.cfg.RTTTimeout)
-
 	// The mediator owns its nested probe's pending entry, same rule as
-	// probeOnce: delete exactly once, here.
-	n.mu.Lock()
-	delete(n.pending, seq)
-	n.mu.Unlock()
+	// probeOnce: register once, delete exactly once.
+	seq, ackCh := n.registerProbe()
+	ok := n.directPing(ctx, target.Addr, seq, ackCh)
+	n.finishProbe(seq)
 
 	if !ok {
 		return // target silent: no relay, the initiator's timeout will tell
@@ -299,6 +418,11 @@ func (n *Node) handlePingReq(ctx context.Context, msg protocol.Message, initiato
 	})
 }
 
+// probeLoop paces probeOnce. The ticker deliberately stays on real time, NOT
+// on Clock: it is the loop's scheduler, not a protocol timeout — no test
+// asserts on when the next probe fires (they call probeOnce directly and park
+// the ticker with a huge ProbeInterval), while every deadline a test DOES
+// depend on (RTT/indirect/suspicion) goes through Clock.
 func (n *Node) probeLoop(ctx context.Context) {
 	ticker := time.NewTicker(n.cfg.ProbeInterval)
 	defer ticker.Stop()
@@ -312,16 +436,54 @@ func (n *Node) probeLoop(ctx context.Context) {
 	}
 }
 
-// waitAck blocks until an Ack lands on ackCh or the timeout elapses (or ctx is
-// cancelled). Returns true iff an Ack arrived. It does NOT touch pending — the
-// caller owns pending[seq]'s lifetime.
+// registerProbe allocates a fresh SeqNo and registers its pending Ack channel
+// (buffered 1, so receiveLoop signals without close and without blocking).
+// The caller becomes the entry's owner: it must release it with finishProbe
+// exactly once, after every phase that could still use the channel is over.
+func (n *Node) registerProbe() (uint64, chan struct{}) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.seqNo++
+	ch := make(chan struct{}, 1)
+	n.pending[n.seqNo] = ch
+	return n.seqNo, ch
+}
+
+// finishProbe releases pending[seq] — the owner's single delete; receiveLoop
+// only ever signals into the channel and never deletes (see KindAck).
+func (n *Node) finishProbe(seq uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.pending, seq)
+}
+
+// directPing is the shared direct-probe primitive of probeOnce's phase 1 and
+// the mediator's nested probe in handlePingReq: send a Ping to addr under an
+// already-registered seq and wait for the matching Ack. The direct-ping
+// timeout (RTTTimeout, via Clock) is defined here ONCE so both callers always
+// agree on it. It does not touch pending — the caller owns pending[seq]'s
+// lifetime via registerProbe/finishProbe, which is what lets probeOnce keep
+// the same seq and channel alive across its indirect phase.
+func (n *Node) directPing(ctx context.Context, addr string, seq uint64, ackCh <-chan struct{}) bool {
+	n.sendMessage(ctx, addr, protocol.Message{
+		Kind:    protocol.KindPing,
+		From:    n.list.Self(),
+		SeqNo:   seq,
+		Updates: n.collectGossip(nil),
+	})
+	return n.waitAck(ctx, ackCh, n.cfg.RTTTimeout)
+}
+
+// waitAck blocks until an Ack lands on ackCh, the Clock-driven timeout
+// elapses, or ctx is cancelled (shutdown). Returns true iff an Ack arrived.
+// It does NOT touch pending — the caller owns pending[seq]'s lifetime.
 func (n *Node) waitAck(ctx context.Context, ackCh <-chan struct{}, timeout time.Duration) bool {
-	wctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	select {
 	case <-ackCh:
 		return true
-	case <-wctx.Done():
+	case <-n.clock.After(timeout):
+		return false
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -334,7 +496,7 @@ func (n *Node) waitAck(ctx context.Context, ackCh <-chan struct{}, timeout time.
 //
 // Deliberate simplification: non-Alive candidates are NOT filtered out — a
 // Suspect mediator is harmless (it just yields no relay). An Alive-only filter
-// is a candidate for Этап 4, once Suspect records actually circulate.
+// remains a candidate for Этап 5, once realistic partitions are exercised.
 //
 // cfg.Rand is not concurrency-safe, so the shuffle runs under n.mu (shared
 // with seqNo/pending); Others() is called before taking n.mu so two locks are
@@ -367,10 +529,16 @@ func (n *Node) pickMediators(target member.ID) []member.Member {
 // incarnation precedence (Suspect > Alive) lets the demotion stick and
 // re-queues the record for gossip, so the whole cluster learns the suspicion.
 // The incarnation is the snapshot probeOnce started from: if the target
-// refuted itself with a higher incarnation meanwhile (Этап 4), Merge rejects
-// this stale suspicion — which is exactly the desired precedence.
-// TODO(Этап 4): arm the suspicion timer here to escalate Suspect->Dead unless
-// the target refutes by bumping its incarnation.
+// refuted itself with a higher incarnation meanwhile, Merge rejects this
+// stale suspicion — which is exactly the desired precedence.
+//
+// Этап 4: entering Suspect arms the escalation timer — unrefuted for
+// SuspicionTimeout means Dead. The timer is armed at the incarnation actually
+// recorded in the list, not the probe's snapshot: the record may already be
+// Suspect at a newer incarnation via gossip, and armSuspicion is idempotent
+// per (ID, incarnation), so a re-suspicion never doubles a timer. If the
+// target already moved past Suspect (Dead, or refuted to a higher-incarnation
+// Alive), there is nothing to arm.
 func (n *Node) suspect(target member.Member) {
 	n.list.Merge(member.Member{
 		ID:          target.ID,
@@ -378,6 +546,95 @@ func (n *Node) suspect(target member.Member) {
 		Incarnation: target.Incarnation, // same incarnation: Suspect outranks Alive
 		State:       member.StateSuspect,
 	})
+	if rec, ok := n.list.Get(target.ID); ok && rec.State == member.StateSuspect {
+		n.armSuspicion(rec)
+	}
+}
+
+// armSuspicion arms the Suspect→Dead escalation timer for target, valid for
+// target.Incarnation. Idempotent per (ID, incarnation): a repeat suspicion at
+// the same (or an older) incarnation is a no-op, so escalation can fire at
+// most once per incarnation. A suspicion at a HIGHER incarnation replaces the
+// armed timer — the old one is obsolete by precedence, and the fresh Suspect
+// deserves its full timeout.
+func (n *Node) armSuspicion(target member.Member) {
+	n.suspMu.Lock()
+	defer n.suspMu.Unlock()
+	if cur, ok := n.suspicions[target.ID]; ok {
+		if cur.incarnation >= target.Incarnation {
+			return
+		}
+		cur.timer.Stop()
+	}
+	id, addr, inc := target.ID, target.Addr, target.Incarnation
+	n.suspicions[id] = &suspicionTimer{
+		incarnation: inc,
+		timer: n.clock.AfterFunc(n.cfg.SuspicionTimeout, func() {
+			n.escalate(id, addr, inc)
+		}),
+	}
+}
+
+// cancelSuspicion disarms target's timer when fresh information supersedes
+// the suspicion: Alive at a higher incarnation is the target's refute; Dead
+// at the same or a higher incarnation means someone else already escalated.
+// Anything weaker (notably Alive at the SAME incarnation — a successful
+// re-probe by us or a third party) deliberately does NOT disarm: per SWIM
+// only the target's own incarnation bump clears a suspicion.
+func (n *Node) cancelSuspicion(id member.ID, inc uint64, state member.State) {
+	n.suspMu.Lock()
+	defer n.suspMu.Unlock()
+	cur, ok := n.suspicions[id]
+	if !ok {
+		return
+	}
+	refuted := state == member.StateAlive && inc > cur.incarnation
+	confirmed := state == member.StateDead && inc >= cur.incarnation
+	if !refuted && !confirmed {
+		return
+	}
+	cur.timer.Stop()
+	delete(n.suspicions, id)
+}
+
+// escalate is the suspicion timer's payload: no refutation arrived within
+// SuspicionTimeout, declare the target Dead. The Merge (same incarnation,
+// Dead > Suspect) both applies the verdict and re-queues it for gossip, so
+// the death spreads like any membership change. If the target moved to a
+// higher incarnation meanwhile (a refute racing the timer), Merge rejects the
+// stale Dead — precedence, not the timer, always has the final word, which is
+// why this must go through Merge and never write the list directly.
+func (n *Node) escalate(id member.ID, addr string, inc uint64) {
+	n.suspMu.Lock()
+	cur, ok := n.suspicions[id]
+	if !ok || cur.incarnation != inc {
+		// Disarmed or re-armed at a newer incarnation between the timer
+		// firing and this callback running: not ours to escalate anymore.
+		n.suspMu.Unlock()
+		return
+	}
+	delete(n.suspicions, id)
+	n.suspMu.Unlock()
+
+	if n.list.Merge(member.Member{
+		ID:          id,
+		Addr:        addr,
+		Incarnation: inc, // same incarnation: Dead outranks Suspect
+		State:       member.StateDead,
+	}) {
+		log.Printf("swim: %s unrefuted for %v — declaring dead (incarnation %d)", id, n.cfg.SuspicionTimeout, inc)
+	}
+}
+
+// stopSuspicionTimers disarms every pending suspicion timer; Run defers it so
+// no escalation outlives the node's ctx.
+func (n *Node) stopSuspicionTimers() {
+	n.suspMu.Lock()
+	defer n.suspMu.Unlock()
+	for id, cur := range n.suspicions {
+		cur.timer.Stop()
+		delete(n.suspicions, id)
+	}
 }
 
 // probeOnce probes a single random peer in up to two phases sharing one SeqNo
@@ -398,21 +655,13 @@ func (n *Node) probeOnce(ctx context.Context) {
 	// the same Rand, possibly concurrently with mediator goroutines).
 	n.mu.Lock()
 	target := others[n.cfg.Rand.Intn(len(others))]
-	n.seqNo++
-	seq := n.seqNo
-	// Buffer of 1 lets receiveLoop signal without close and without blocking.
-	ackCh := make(chan struct{}, 1)
-	n.pending[seq] = ackCh
 	n.mu.Unlock()
 
-	// Phase 1: direct Ping.
-	n.sendMessage(ctx, target.Addr, protocol.Message{
-		Kind:    protocol.KindPing,
-		From:    n.list.Self(),
-		SeqNo:   seq,
-		Updates: n.collectGossip(nil),
-	})
-	acked := n.waitAck(ctx, ackCh, n.cfg.RTTTimeout)
+	seq, ackCh := n.registerProbe()
+
+	// Phase 1: direct Ping — the same primitive the mediator uses, so the
+	// direct timeout lives in exactly one place (directPing).
+	acked := n.directPing(ctx, target.Addr, seq, ackCh)
 
 	mediators := 0
 	if !acked {
@@ -437,11 +686,9 @@ func (n *Node) probeOnce(ctx context.Context) {
 		// nobody can probe indirectly, fall through with acked == false.
 	}
 
-	// Idempotent cleanup, exactly once, after BOTH phases: probeOnce owns the
-	// entry; receiveLoop only signals into it and never deletes.
-	n.mu.Lock()
-	delete(n.pending, seq)
-	n.mu.Unlock()
+	// Cleanup exactly once, after BOTH phases: probeOnce owns the entry;
+	// receiveLoop only signals into it and never deletes.
+	n.finishProbe(seq)
 
 	if acked {
 		// Re-assert liveness at the known incarnation. Merge can legitimately
@@ -450,9 +697,9 @@ func (n *Node) probeOnce(ctx context.Context) {
 		// incarnation — Merge's Suspect>Alive precedence at equal incarnation
 		// (member.go stateRank) then rejects this Ack-driven Alive, and the
 		// record stays Suspect. That second case is intentional SWIM
-		// semantics carried over from Этап 3: a successful probe from a third
-		// party does not clear suspicion, only the target's own higher-
-		// incarnation refute does (Этап 4).
+		// semantics: a successful probe from a third party does not clear
+		// suspicion (nor disarm its timer) — only the target's own higher-
+		// incarnation refute does (see maybeRefute/cancelSuspicion).
 		n.list.Merge(member.Member{
 			ID:          target.ID,
 			Addr:        target.Addr,
