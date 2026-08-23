@@ -7,17 +7,31 @@ import (
 )
 
 // FakeNetwork is the shared in-memory switch that routes datagrams between
-// registered fake endpoints. Этап 1: lossless, zero-delay — it exists so swim
-// ping/ack can be tested without real sockets. Этап 5 adds per-link drop-rate,
-// delay and partition here.
+// registered fake endpoints. It is lossless and zero-delay by default; the
+// only controlled loss is DropLink's directed per-link drop (the Этап 3
+// minimum). The full drop-rate/delay/partition simulator is Этап 5.
 type FakeNetwork struct {
 	mu        sync.RWMutex
 	endpoints map[string]*Fake // addr -> endpoint
+	// dropped marks directed links (from, to) whose packets silently vanish.
+	dropped map[[2]string]bool
 }
 
 // NewFakeNetwork creates an empty in-memory network.
 func NewFakeNetwork() *FakeNetwork {
-	return &FakeNetwork{endpoints: map[string]*Fake{}}
+	return &FakeNetwork{
+		endpoints: map[string]*Fake{},
+		dropped:   map[[2]string]bool{},
+	}
+}
+
+// DropLink makes every packet sent from `from` to `to` vanish (one-way).
+// Minimal knob for the Этап 3 false-positive test; the full drop/delay/
+// partition simulator is Этап 5 — do not grow this into rates or delays.
+func (n *FakeNetwork) DropLink(from, to string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.dropped[[2]string{from, to}] = true
 }
 
 // Endpoint creates and registers a Fake transport bound to addr on this
@@ -39,7 +53,8 @@ func (n *FakeNetwork) Endpoint(addr string) *Fake {
 	return f
 }
 
-// Fake is an in-memory Transport endpoint on a FakeNetwork. Этап 1: lossless.
+// Fake is an in-memory Transport endpoint on a FakeNetwork: lossless unless a
+// DropLink covers the destination.
 type Fake struct {
 	net       *FakeNetwork
 	local     string
@@ -57,10 +72,11 @@ func (f *Fake) Send(ctx context.Context, addr string, payload []byte) error {
 	}
 	f.net.mu.RLock()
 	dst, ok := f.net.endpoints[addr]
+	drop := f.net.dropped[[2]string{f.local, addr}]
 	f.net.mu.RUnlock()
-	if !ok {
-		// Best-effort, like UDP to a dark address: the packet vanishes, the
-		// transport reports no error.
+	if !ok || drop {
+		// Best-effort, like UDP to a dark address (or across a dropped link):
+		// the packet vanishes, the transport reports no error.
 		return nil
 	}
 	// Copy so sender and receiver never share a buffer (data-race safety).

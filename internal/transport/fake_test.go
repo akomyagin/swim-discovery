@@ -77,6 +77,43 @@ func TestFake_Close(t *testing.T) {
 	}
 }
 
+// TestFake_DropLink proves the drop is directed: A->B vanishes silently while
+// the reverse link B->A keeps delivering.
+func TestFake_DropLink(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	network := NewFakeNetwork()
+	a := network.Endpoint("A")
+	defer a.Close()
+	b := network.Endpoint("B")
+	defer b.Close()
+
+	network.DropLink("A", "B")
+
+	// Dropped direction: best-effort, no error — and nothing arrives at B.
+	if err := a.Send(ctx, "B", []byte("lost")); err != nil {
+		t.Fatalf("Send over dropped link = %v, want nil", err)
+	}
+	rctx, rcancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer rcancel()
+	if pkt, err := b.Receive(rctx); err == nil {
+		t.Errorf("B received %q over a dropped link, want nothing", pkt.Payload)
+	}
+
+	// Reverse direction still works.
+	if err := b.Send(ctx, "A", []byte("back")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	pkt, err := a.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive on intact reverse link: %v", err)
+	}
+	if !bytes.Equal(pkt.Payload, []byte("back")) {
+		t.Errorf("payload = %q, want %q", pkt.Payload, "back")
+	}
+}
+
 func TestFake_PayloadCopied(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

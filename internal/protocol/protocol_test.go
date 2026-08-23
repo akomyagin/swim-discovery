@@ -76,6 +76,35 @@ func TestEncodeDecode_WithUpdates(t *testing.T) {
 	}
 }
 
+// TestEncodeDecode_PingReq fixes the full indirect-probe envelope (Этап 3):
+// Target and the initiator's end-to-end SeqNo must survive the wire together
+// with piggybacked gossip — the mediator relies on both coming back intact.
+func TestEncodeDecode_PingReq(t *testing.T) {
+	msg := Message{
+		Kind:   KindPingReq,
+		From:   "I",
+		SeqNo:  42,
+		Target: "T",
+		Updates: []Update{
+			{ID: "T", Addr: "T", Incarnation: 3, State: member.StateAlive},
+		},
+	}
+	payload, err := Encode(msg)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := Decode(payload)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got.Target != "T" {
+		t.Errorf("Target after round-trip = %q, want %q", got.Target, "T")
+	}
+	if !reflect.DeepEqual(got, msg) {
+		t.Errorf("round-trip = %+v, want %+v", got, msg)
+	}
+}
+
 func TestDecode_Garbage(t *testing.T) {
 	if _, err := Decode([]byte("{ broken")); err == nil {
 		t.Error("Decode of garbage returned nil error, want non-nil")
