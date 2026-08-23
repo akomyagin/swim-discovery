@@ -78,7 +78,7 @@ func TestNode_PingAck_ConfirmsAlive(t *testing.T) {
 	// Proves the Ack was actually received rather than merely that B started
 	// (and stayed) Alive regardless of outcome: a real Ack over the fake
 	// transport returns almost instantly, while a missed Ack only returns
-	// after the full RTTTimeout (see TestNode_ProbeTimeout_NoAck_StaysAlive).
+	// after the full RTTTimeout (see TestNode_ProbeTimeout_NoIndirect_MarksSuspect).
 	if elapsed >= cfg.RTTTimeout/2 {
 		t.Fatalf("probeOnce took %v (RTTTimeout %v) — looks like it timed out waiting for an Ack instead of receiving one", elapsed, cfg.RTTTimeout)
 	}
@@ -99,7 +99,13 @@ func TestNode_PingAck_ConfirmsAlive(t *testing.T) {
 	}
 }
 
-func TestNode_ProbeTimeout_NoAck_StaysAlive(t *testing.T) {
+// TestNode_ProbeTimeout_NoIndirect_MarksSuspect replaces Этап 1's
+// TestNode_ProbeTimeout_NoAck_StaysAlive with the OPPOSITE expectation: since
+// Этап 3 a fully failed probe demotes the peer. In a 2-node cluster the only
+// Other IS the target, so pickMediators returns nobody, the indirect phase is
+// skipped, and the direct timeout alone leads straight to Suspect — correct
+// SWIM behavior when indirect probing is physically impossible.
+func TestNode_ProbeTimeout_NoIndirect_MarksSuspect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -130,12 +136,17 @@ func TestNode_ProbeTimeout_NoAck_StaysAlive(t *testing.T) {
 		t.Fatal("probeOnce hung past RTTTimeout")
 	}
 
-	// Этап 1 boundary: a missing Ack must NOT demote the peer — Suspect
-	// transitions arrive only with Этапы 3/4.
+	found := false
 	for _, m := range listA.Members() {
-		if m.ID == "B" && m.State != member.StateAlive {
-			t.Errorf("B state = %v, want alive (no Suspect in Этап 1)", m.State)
+		if m.ID == "B" {
+			found = true
+			if m.State != member.StateSuspect {
+				t.Errorf("B state = %v, want suspect (direct probe failed, no mediators available)", m.State)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("B missing from listA after probe")
 	}
 }
 
@@ -319,6 +330,273 @@ func TestNode_ReceiveAbsorbsGossip(t *testing.T) {
 	}
 	if !foundSelf {
 		t.Errorf("ack Updates = %+v, want A's self-announcement", ack.Updates)
+	}
+}
+
+// fullList builds a membership list for self that already knows every node in
+// ids — the fixed {I, M, T} topology shared by the indirect-probe tests.
+func fullList(self string, ids ...string) *member.List {
+	l := member.NewList(member.Member{ID: member.ID(self), Addr: self, State: member.StateAlive})
+	for _, id := range ids {
+		if id != self {
+			l.Merge(member.Member{ID: member.ID(id), Addr: id, State: member.StateAlive})
+		}
+	}
+	return l
+}
+
+// TestNode_IndirectProbe_SuppressesFalsePositive is the project's central
+// invariant (Этап 3): losing only the INITIATOR's packets to a live target
+// must not get the target marked Suspect — a mediator's indirect ping has to
+// rescue it. Topology: I, T, M all know each other; the I->T link is dropped
+// (one-way!), every other link works. I's direct Ping dies, its PingReq
+// reaches M, M pings T, T answers M, M relays the Ack under I's SeqNo — the
+// probe closes as success and T stays Alive.
+func TestNode_IndirectProbe_SuppressesFalsePositive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	// Only I->T vanishes; T->I, I<->M and M<->T keep working.
+	network.DropLink("I", "T")
+
+	listI := fullList("I", "I", "M", "T")
+	listM := fullList("M", "I", "M", "T")
+	listT := fullList("T", "I", "M", "T")
+
+	// Generous IndirectTimeout: the relay crosses two extra hops (I->M->T->M->I)
+	// but on the in-memory fake that is microseconds — the window only needs to
+	// never expire first. RTTTimeout stays short because phase 1 ALWAYS burns
+	// it fully here (the direct Ping is dropped), and this test runs -count=200.
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: 100 * time.Millisecond, IndirectTimeout: 2 * time.Second}
+	cfgI := cfg
+	// Seed 1: the first Intn(2) yields 1, so I's probe target is Others()[1]
+	// == T (Others sorts by ID: [M, T]). The elapsed-time assert below still
+	// verifies the choice at runtime.
+	cfgI.Rand = rand.New(rand.NewSource(1))
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeM := NewNode(listM, trM, cfg)
+	nodeT := NewNode(listT, trT, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopM := startNode(t, nodeM)
+	defer stopM()
+	stopT := startNode(t, nodeT)
+	defer stopT()
+
+	start := time.Now()
+	nodeI.probeOnce(ctx)
+	elapsed := time.Since(start)
+
+	// The direct phase must have burned (most of) its RTTTimeout — the I->T
+	// link is down. A near-instant return would mean the probe actually hit M
+	// (wrong target) and the assertions below would pass vacuously.
+	if elapsed < cfg.RTTTimeout/2 {
+		t.Fatalf("probeOnce returned in %v (RTTTimeout %v) — direct ping got answered, so the probe target was not T", elapsed, cfg.RTTTimeout)
+	}
+
+	var tRec *member.Member
+	for _, m := range listI.Members() {
+		if m.ID == "T" {
+			mm := m
+			tRec = &mm
+			break
+		}
+	}
+	if tRec == nil {
+		t.Fatal("T missing from listI after probe")
+	}
+	if tRec.State != member.StateAlive {
+		t.Fatalf("T state = %v, want alive — indirect probe must suppress the false positive", tRec.State)
+	}
+}
+
+// TestNode_IndirectProbe_AllFail_MarksSuspect is the negative counterpart: T
+// is genuinely unreachable (never even registered on the network), so both the
+// direct Ping and M's indirect ping stay silent, and the chain must terminate
+// in Suspect — not hang, not leave T Alive.
+func TestNode_IndirectProbe_AllFail_MarksSuspect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	// T is never registered: every Ping to it — direct or via M — goes dark.
+
+	listI := fullList("I", "I", "M", "T")
+	listM := fullList("M", "I", "M", "T")
+
+	// Short timeouts are safe here: every wait is a genuine timeout, nothing
+	// has to "beat" a deadline, so the outcome is timing-independent.
+	cfg := Config{ProbeInterval: time.Hour, RTTTimeout: 50 * time.Millisecond, IndirectTimeout: 150 * time.Millisecond}
+	cfgI := cfg
+	// Seed 1 again: first Intn(2) == 1 selects T from Others() == [M, T].
+	cfgI.Rand = rand.New(rand.NewSource(1))
+	nodeI := NewNode(listI, trI, cfgI)
+	nodeM := NewNode(listM, trM, cfg)
+
+	stopI := startNode(t, nodeI)
+	defer stopI()
+	stopM := startNode(t, nodeM)
+	defer stopM()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nodeI.probeOnce(ctx)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("probeOnce hung past both probe phases")
+	}
+
+	var tRec *member.Member
+	for _, m := range listI.Members() {
+		if m.ID == "T" {
+			mm := m
+			tRec = &mm
+			break
+		}
+	}
+	if tRec == nil {
+		t.Fatal("T missing from listI after probe")
+	}
+	if tRec.State != member.StateSuspect {
+		t.Errorf("T state = %v, want suspect after direct + indirect both failed", tRec.State)
+	}
+}
+
+// TestNode_RelaysPingReq isolates the mediator role (the PingReq analogue of
+// TestNode_RespondsAckToPing): a running node M gets a hand-crafted PingReq
+// from a bare initiator endpoint, pings the target itself under its OWN seq,
+// and after the target's Ack relays an Ack to the initiator carrying the
+// initiator's ORIGINAL SeqNo.
+func TestNode_RelaysPingReq(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	trT := network.Endpoint("T")
+	defer trT.Close()
+
+	// Only M is a real node; it must know T to be able to mediate. I and T
+	// are driven by hand. M not knowing I is deliberate: the relay goes to the
+	// packet's source address, membership knowledge of the initiator is not
+	// required.
+	listM := fullList("M", "M", "T")
+	nodeM := NewNode(listM, trM, Config{ProbeInterval: time.Hour, RTTTimeout: 2 * time.Second})
+	stopM := startNode(t, nodeM)
+	defer stopM()
+
+	const initiatorSeq = 77
+	pingReq := protocol.Message{Kind: protocol.KindPingReq, From: "I", Target: "T", SeqNo: initiatorSeq}
+	payload, err := protocol.Encode(pingReq)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := trI.Send(ctx, "M", payload); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// T receives M's nested Ping: it must be M's own probe, under M's own seq.
+	pkt, err := trT.Receive(ctx)
+	if err != nil {
+		t.Fatalf("T Receive: %v", err)
+	}
+	ping, err := protocol.Decode(pkt.Payload)
+	if err != nil {
+		t.Fatalf("Decode ping: %v", err)
+	}
+	if ping.Kind != protocol.KindPing {
+		t.Fatalf("T got kind = %v, want KindPing", ping.Kind)
+	}
+	if ping.From != "M" {
+		t.Errorf("nested ping From = %q, want %q", ping.From, "M")
+	}
+	if ping.SeqNo == initiatorSeq {
+		t.Errorf("nested ping SeqNo = %d — mediator must use its OWN seq, not the initiator's", ping.SeqNo)
+	}
+
+	// T answers M's ping by hand.
+	ackPayload, err := protocol.Encode(protocol.Message{Kind: protocol.KindAck, From: "T", SeqNo: ping.SeqNo})
+	if err != nil {
+		t.Fatalf("Encode ack: %v", err)
+	}
+	if err := trT.Send(ctx, pkt.Addr, ackPayload); err != nil {
+		t.Fatalf("Send ack: %v", err)
+	}
+
+	// I receives the relay: an Ack from M carrying the initiator's SeqNo.
+	relayPkt, err := trI.Receive(ctx)
+	if err != nil {
+		t.Fatalf("I Receive: %v", err)
+	}
+	relay, err := protocol.Decode(relayPkt.Payload)
+	if err != nil {
+		t.Fatalf("Decode relay: %v", err)
+	}
+	if relay.Kind != protocol.KindAck {
+		t.Errorf("relay kind = %v, want KindAck", relay.Kind)
+	}
+	if relay.SeqNo != initiatorSeq {
+		t.Errorf("relay SeqNo = %d, want the initiator's %d echoed unchanged", relay.SeqNo, initiatorSeq)
+	}
+	if relay.From != "M" {
+		t.Errorf("relay From = %q, want %q", relay.From, "M")
+	}
+}
+
+// TestNode_PingReq_TargetSilent_NoRelay fixes the mediator's failure mode:
+// when its nested Ping to the target gets no Ack, the mediator sends NOTHING
+// back — the protocol has no negative reply, the initiator learns of the
+// failure only through its own indirect timeout.
+func TestNode_PingReq_TargetSilent_NoRelay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	network := transport.NewFakeNetwork()
+	trI := network.Endpoint("I")
+	defer trI.Close()
+	trM := network.Endpoint("M")
+	defer trM.Close()
+	// T is never registered: M's nested Ping goes dark.
+
+	listM := fullList("M", "M", "T")
+	nodeM := NewNode(listM, trM, Config{ProbeInterval: time.Hour, RTTTimeout: 50 * time.Millisecond})
+	stopM := startNode(t, nodeM)
+	defer stopM()
+
+	payload, err := protocol.Encode(protocol.Message{Kind: protocol.KindPingReq, From: "I", Target: "T", SeqNo: 5})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := trI.Send(ctx, "M", payload); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// Wait well past M's RTTTimeout: the only acceptable outcome is a Receive
+	// deadline, never a relayed Ack.
+	rctx, rcancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer rcancel()
+	if pkt, err := trI.Receive(rctx); err == nil {
+		msg, _ := protocol.Decode(pkt.Payload)
+		t.Fatalf("I received %+v, want silence (mediator must not relay on target timeout)", msg)
 	}
 }
 

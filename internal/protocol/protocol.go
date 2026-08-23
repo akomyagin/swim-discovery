@@ -44,9 +44,13 @@ type Update struct {
 type Message struct {
 	Kind Kind      `json:"kind"`
 	From member.ID `json:"from"`
-	// SeqNo correlates a Ping/PingReq with its Ack.
+	// SeqNo correlates a Ping/PingReq with its Ack. For a PingReq it is the
+	// initiator's end-to-end probe key: the mediator pings the target under
+	// its own SeqNo, then echoes this one unchanged in the relayed Ack, so
+	// any Ack carrying it — direct or relayed — closes the initiator's probe.
 	SeqNo uint64 `json:"seq"`
-	// Target is the node to probe; only meaningful for KindPingReq.
+	// Target is set on KindPingReq (the node the mediator must probe) and
+	// echoed nowhere else.
 	Target member.ID `json:"target,omitempty"`
 	// Updates are piggybacked gossip (Этап 2).
 	Updates []Update `json:"updates,omitempty"`

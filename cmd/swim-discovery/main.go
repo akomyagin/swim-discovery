@@ -44,8 +44,9 @@ func main() {
 	defer tr.Close()
 
 	// Gossip needs no dedicated loop: membership updates piggyback on the
-	// probe/ack traffic that Node.Run already drives (Этап 2).
-	// TODO(Этап 3): wire indirect probing (PingReq to K random peers).
+	// probe/ack traffic that Node.Run already drives (Этап 2). Indirect
+	// probing (Этап 3) also needs no wiring here: NewNode defaults
+	// IndirectNodes/IndirectTimeout and probeOnce escalates on its own.
 	// TODO(Этап 4): run the suspicion-timeout scheduler.
 	// TODO(Этап 5): add the `members`/observe CLI subcommand.
 	node := swim.NewNode(list, tr, swim.Config{
