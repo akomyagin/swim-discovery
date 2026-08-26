@@ -991,6 +991,70 @@ func TestNode_SuspicionConcurrentArmCancel(t *testing.T) {
 	}
 }
 
+// TestNode_EvictionConcurrentArmCancel is the Этап 6 analogue of
+// TestNode_SuspicionConcurrentArmCancel: a gossip-delivered Dead (arms
+// armEviction) races a gossip-delivered higher-incarnation Alive
+// (cancelEviction) for the same peer, while a third goroutine advances the
+// fake clock so any eviction timer that does end up armed actually fires —
+// exercising evict's callback (running on the Advance goroutine) concurrently
+// with applyGossip on the other goroutines, under -race. No interleaving may
+// evict a peer that the Alive@2 rumor ultimately wins for: Merge precedence
+// (higher incarnation always wins) must hold regardless of arrival order.
+func TestNode_EvictionConcurrentArmCancel(t *testing.T) {
+	clock := newFakeClock()
+	network := transport.NewFakeNetwork()
+	trA := network.Endpoint("A")
+	defer trA.Close()
+
+	listA := member.NewList(member.Member{ID: "A", Addr: "A", State: member.StateAlive})
+	const peers = 8
+	ids := make([]member.ID, peers)
+	for i := 0; i < peers; i++ {
+		ids[i] = member.ID("B" + string(rune('0'+i)))
+		listA.Merge(member.Member{ID: ids[i], Addr: string(ids[i]), Incarnation: 1, State: member.StateAlive})
+	}
+	nodeA := NewNode(listA, trA, Config{
+		ProbeInterval:    time.Hour,
+		SuspicionTimeout: 10 * time.Second,
+		DeadTimeout:      10 * time.Second,
+		Clock:            clock,
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < peers; i++ {
+		id := ids[i]
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			nodeA.applyGossip([]protocol.Update{
+				{ID: id, Addr: string(id), Incarnation: 1, State: member.StateDead},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			nodeA.applyGossip([]protocol.Update{
+				{ID: id, Addr: string(id), Incarnation: 2, State: member.StateAlive},
+			})
+		}()
+	}
+	wg.Add(1)
+	go func() { // time moves while eviction timers are being armed and cancelled
+		defer wg.Done()
+		for k := 0; k < 5; k++ {
+			clock.Advance(3 * time.Second)
+		}
+	}()
+	wg.Wait()
+	clock.Advance(20 * time.Second) // fire anything still armed
+
+	for _, id := range ids {
+		rec, ok := listA.Get(id)
+		if !ok || rec.State != member.StateAlive || rec.Incarnation != 2 {
+			t.Errorf("%s = %v@%d (ok=%v), want alive@2 in every interleaving, never evicted", id, rec.State, rec.Incarnation, ok)
+		}
+	}
+}
+
 // TestNode_RefuteAfterDeadEscalation_Recovers: a refute is not "too late" —
 // Merge precedence has no notion of it. Even after this node already
 // escalated B to Dead on its own, a higher-incarnation Alive rumor arriving
@@ -1366,5 +1430,177 @@ func TestNode_DeadEscalation_SpreadsViaGossip(t *testing.T) {
 	rec, ok := listC.Get("B")
 	if !ok || rec.State != member.StateDead {
 		t.Fatalf("neighbor C's view of B = %+v (known=%v), want dead after absorbing the gossip batch", rec, ok)
+	}
+}
+
+// ---- Этап 6: eviction of Dead records ------------------------------------
+//
+// Same deterministic fakeClock pattern as the Этап 4 suspicion tests. The
+// eviction window is set explicitly (20s) instead of relying on the production
+// default, so the Advance arithmetic below is obvious and never accidentally
+// coincides with the 10s suspicion window.
+
+// evictionFixture is the shared setup: node A (fakeClock, 10s suspicion
+// window, 20s dead window) that knows B alive at incarnation 4.
+func evictionFixture(t *testing.T) (*Node, *member.List, *fakeClock) {
+	t.Helper()
+	clock := newFakeClock()
+	network := transport.NewFakeNetwork()
+	trA := network.Endpoint("A")
+	t.Cleanup(func() { trA.Close() })
+
+	listA := member.NewList(member.Member{ID: "A", Addr: "A", State: member.StateAlive})
+	listA.Merge(member.Member{ID: "B", Addr: "B", Incarnation: 4, State: member.StateAlive})
+	drainGossip(listA)
+
+	nodeA := NewNode(listA, trA, Config{
+		ProbeInterval:    time.Hour,
+		SuspicionTimeout: 10 * time.Second,
+		DeadTimeout:      20 * time.Second,
+		Clock:            clock,
+	})
+	return nodeA, listA, clock
+}
+
+// TestNode_DeadEvictsAfterTimeout is the headline test of Этап 6: a locally
+// escalated Dead lingers for exactly DeadTimeout (spreading the death rumor
+// meanwhile) and is then removed from the list entirely.
+func TestNode_DeadEvictsAfterTimeout(t *testing.T) {
+	nodeA, listA, clock := evictionFixture(t)
+
+	nodeA.suspect(member.Member{ID: "B", Addr: "B", Incarnation: 4})
+	clock.Advance(10 * time.Second) // SuspicionTimeout: escalate arms the eviction timer
+	if rec, ok := listA.Get("B"); !ok || rec.State != member.StateDead {
+		t.Fatalf("B = %+v (known=%v) after escalation, want dead and still listed", rec, ok)
+	}
+
+	// One tick short of the eviction deadline: the record must still linger.
+	clock.Advance(20*time.Second - time.Millisecond)
+	if rec, ok := listA.Get("B"); !ok || rec.State != member.StateDead {
+		t.Fatalf("B = %+v (known=%v) just before DeadTimeout, want still dead in the list", rec, ok)
+	}
+
+	clock.Advance(time.Millisecond) // exactly SuspicionTimeout + DeadTimeout in total
+	if rec, ok := listA.Get("B"); ok {
+		t.Fatalf("B = %+v still known after DeadTimeout, want evicted", rec)
+	}
+}
+
+// TestNode_DeadFromGossip_Evicts: a death learned by rumor (applyGossip), not
+// by our own escalation, must also start this node's grace timer and evict.
+func TestNode_DeadFromGossip_Evicts(t *testing.T) {
+	nodeA, listA, clock := evictionFixture(t)
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 4, State: member.StateDead},
+	})
+	if rec, ok := listA.Get("B"); !ok || rec.State != member.StateDead {
+		t.Fatalf("B = %+v (known=%v) after the Dead rumor, want dead", rec, ok)
+	}
+
+	clock.Advance(20 * time.Second)
+	if rec, ok := listA.Get("B"); ok {
+		t.Fatalf("B = %+v still known after DeadTimeout, want evicted (rumor-armed timer)", rec)
+	}
+}
+
+// TestNode_ReviveBeforeEvict_NotEvicted is the central guard test: a revive
+// (Alive at a higher incarnation) landing before the eviction deadline must
+// cancel the eviction — a live member is never silently dropped.
+func TestNode_ReviveBeforeEvict_NotEvicted(t *testing.T) {
+	nodeA, listA, clock := evictionFixture(t)
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 4, State: member.StateDead},
+	})
+	clock.Advance(20*time.Second - time.Millisecond) // almost, but not quite
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 5, State: member.StateAlive},
+	})
+	if rec, _ := listA.Get("B"); rec.State != member.StateAlive || rec.Incarnation != 5 {
+		t.Fatalf("B = %v@%d after revive, want alive@5", rec.State, rec.Incarnation)
+	}
+
+	clock.Advance(time.Millisecond) // the old deadline passes
+	clock.Advance(20 * time.Second) // and then some — nothing may fire
+	rec, ok := listA.Get("B")
+	if !ok || rec.State != member.StateAlive || rec.Incarnation != 5 {
+		t.Fatalf("B = %+v (known=%v) after the cancelled deadline, want alive@5 still listed", rec, ok)
+	}
+}
+
+// TestNode_Evict_ThenReviveIsFreshInsert: after an eviction the list keeps no
+// memory of the old record — a later rumor about the same ID inserts fresh,
+// at whatever incarnation the rumor carries (§5 of the stage plan).
+func TestNode_Evict_ThenReviveIsFreshInsert(t *testing.T) {
+	nodeA, listA, clock := evictionFixture(t)
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 4, State: member.StateDead},
+	})
+	clock.Advance(20 * time.Second)
+	if _, ok := listA.Get("B"); ok {
+		t.Fatal("B still known after DeadTimeout, want evicted (test setup)")
+	}
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 1, State: member.StateAlive},
+	})
+	rec, ok := listA.Get("B")
+	if !ok || rec.State != member.StateAlive || rec.Incarnation != 1 {
+		t.Fatalf("B = %+v (known=%v) after post-eviction revive, want alive@1 — a fresh insert with no memory of the evicted incarnation 4", rec, ok)
+	}
+}
+
+// TestNode_ProbeAllDead_NoOp checks probeOnce's Dead filter (§6): with every
+// peer Dead the target pool is empty, so the probe is a no-op — no Ping goes
+// out (seqNo stays untouched) and the Dead record is not re-suspected.
+func TestNode_ProbeAllDead_NoOp(t *testing.T) {
+	nodeA, listA, _ := evictionFixture(t)
+	listA.Merge(member.Member{ID: "B", Addr: "B", Incarnation: 4, State: member.StateDead})
+
+	// The timeout only bounds a broken run: with the filter in place probeOnce
+	// returns immediately, before ever registering a probe or touching the
+	// fakeClock (which nobody advances here).
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	nodeA.probeOnce(ctx)
+
+	nodeA.mu.Lock()
+	seq := nodeA.seqNo
+	nodeA.mu.Unlock()
+	if seq != 0 {
+		t.Errorf("seqNo = %d after probeOnce with only Dead peers, want 0 (no probe registered)", seq)
+	}
+	rec, ok := listA.Get("B")
+	if !ok || rec.State != member.StateDead || rec.Incarnation != 4 {
+		t.Fatalf("B = %+v (known=%v) after probeOnce, want dead@4 unchanged", rec, ok)
+	}
+}
+
+// TestNode_EvictionTimerStoppedOnShutdown mirrors the stopSuspicionTimers
+// guarantee: when Run returns, no armed eviction timer survives.
+func TestNode_EvictionTimerStoppedOnShutdown(t *testing.T) {
+	nodeA, _, _ := evictionFixture(t)
+
+	nodeA.applyGossip([]protocol.Update{
+		{ID: "B", Addr: "B", Incarnation: 4, State: member.StateDead},
+	})
+	nodeA.evictMu.Lock()
+	armed := len(nodeA.evictions)
+	nodeA.evictMu.Unlock()
+	if armed != 1 {
+		t.Fatalf("evictions armed = %d after the Dead rumor, want 1 (test setup)", armed)
+	}
+
+	stop := startNode(t, nodeA)
+	stop() // cancel ctx well before DeadTimeout
+
+	nodeA.evictMu.Lock()
+	left := len(nodeA.evictions)
+	nodeA.evictMu.Unlock()
+	if left != 0 {
+		t.Errorf("evictions left = %d after Run returned, want 0 (stopEvictionTimers)", left)
 	}
 }

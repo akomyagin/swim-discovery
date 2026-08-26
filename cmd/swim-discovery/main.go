@@ -119,8 +119,10 @@ func observeLoop(ctx context.Context, list *member.List, interval time.Duration)
 
 // printMembers writes one human-readable snapshot of the membership view to
 // stdout (fmt, not log: a table gains nothing from per-line time prefixes).
-// Dead members stay listed on purpose — the observer is exactly who must see
-// a death (Этап 5 decision: no eviction of Dead records).
+// A Dead member stays listed for swim.Config.DeadTimeout after the death is
+// declared — the observer is exactly who must see the transition — then
+// disappears once the local node evicts the record (see member.List.Evict,
+// Этап 6).
 func printMembers(list *member.List, start time.Time) {
 	members := list.Members()
 	fmt.Printf("[observe %s] t=%s  members=%d\n", list.Self(), time.Since(start).Round(time.Second), len(members))

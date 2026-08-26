@@ -170,11 +170,51 @@ func (l *List) Merge(m Member) (changed bool) {
 	return true
 }
 
+// Evict removes id from the membership view entirely — the only path that
+// deletes a record, and only for a member this node still sees as Dead at the
+// given incarnation. It drops the record from BOTH members and gossipTx under
+// one lock, preserving the "gossipTx keys ⊆ members keys" invariant that lets
+// PendingGossip dereference *l.members[id] without a presence check. The
+// incarnation+Dead guard makes eviction race-safe against a revive: if a
+// higher-incarnation Alive rumor resurrected id after the eviction timer was
+// armed (see swim.Node.evict), the record is no longer Dead@inc and Evict is a
+// no-op, so a live member is never silently dropped. self is never evicted.
+// Returns true iff a record was actually removed.
+func (l *List) Evict(id ID, inc uint64) (evicted bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if id == l.self {
+		// The self record carries this node's current incarnation — dropping
+		// it would forget our own refute counter. Never evict self.
+		return false
+	}
+	cur, ok := l.members[id]
+	if !ok {
+		return false // already evicted, or never known
+	}
+	if cur.State != StateDead || cur.Incarnation != inc {
+		// Precedence guard, mirror of swim.Node.escalate's: evict only a
+		// record still Dead at exactly the incarnation the timer was armed at.
+		// Any divergence (a revive to Alive at a higher incarnation, or the
+		// record having moved on) cancels the eviction.
+		return false
+	}
+	delete(l.members, id)
+	// Dropping the gossipTx key alongside cancels whatever remained of the
+	// Dead rumor's retransmit budget — correct, because the grace period for
+	// disseminating the death has already elapsed (see swim.Config.DeadTimeout).
+	delete(l.gossipTx, id)
+	return true
+}
+
 // PendingGossip returns up to limit membership records that still need to be
 // disseminated, least-spread first (largest remaining retransmit budget), and
 // decrements each returned record's budget. A record whose budget reaches zero
 // is dropped from the gossip queue until Merge marks it changed again. Returns
-// a snapshot (copies), safe to encode after the lock is released.
+// a snapshot (copies), safe to encode after the lock is released. The bare
+// dereference of *l.members[id] below is safe because gossipTx keys are always
+// a subset of members keys: both maps live under the same l.mu, and Evict —
+// the only path that deletes a record — removes both keys atomically.
 //
 // exclude skips candidates whose ID is set, without spending their budget:
 // echoing a record straight back to the peer that just supplied it is a

@@ -77,6 +77,13 @@ type Config struct {
 	// indirect-probing rescue (Этап 3) always gets to finish long before the
 	// suspicion deadline can possibly fire.
 	SuspicionTimeout time.Duration
+	// DeadTimeout is the grace period a Dead record lingers before this node
+	// evicts it from the list entirely. Zero => production default (see NewNode).
+	// Ordered ABOVE SuspicionTimeout: a node lives in the list as Dead at least
+	// as long as it lived as Suspect, so the death rumor has time to spread by
+	// gossip before the record is forgotten (evicting sooner would erase it
+	// before peers learn of the death). See member.List.Evict.
+	DeadTimeout time.Duration
 	// Clock drives every probe/suspicion timeout. Nil => systemClock; tests
 	// inject fakeClock to advance time deterministically.
 	Clock Clock
@@ -109,12 +116,28 @@ type Node struct {
 	// which fire from Clock goroutines — contend only with each other).
 	suspMu     sync.Mutex
 	suspicions map[member.ID]*suspicionTimer
+
+	// evictions holds the armed Dead→evicted timers, one per target, each valid
+	// only for the incarnation it was armed at (mirrors suspicions). Guarded by
+	// its own evictMu, same rationale as suspMu: eviction bookkeeping stays out
+	// of the hot seqNo/pending/Rand section, and Clock-goroutine callbacks
+	// contend only with each other.
+	evictMu   sync.Mutex
+	evictions map[member.ID]*evictionTimer
 }
 
 // suspicionTimer is one armed Suspect→Dead escalation, valid only for the
 // incarnation the target was suspected at: any information at a higher
 // incarnation (a refute above all) obsoletes and cancels it.
 type suspicionTimer struct {
+	incarnation uint64
+	timer       Timer
+}
+
+// evictionTimer is one armed Dead→evicted removal, valid only for the
+// incarnation the target was declared Dead at: a revive at a higher
+// incarnation obsoletes and cancels it (mirrors suspicionTimer).
+type evictionTimer struct {
 	incarnation uint64
 	timer       Timer
 }
@@ -149,6 +172,12 @@ func NewNode(list *member.List, tr transport.Transport, cfg Config) *Node {
 		// invariant (packet loss to a live node must not kill it) breaks.
 		cfg.SuspicionTimeout = 5 * time.Second
 	}
+	if cfg.DeadTimeout == 0 {
+		// Above SuspicionTimeout (5s): the Dead rumor must fully disseminate
+		// before the record is forgotten. See member.List.Evict and the timeout
+		// ladder note above (RTT+Indirect << Suspicion < Dead).
+		cfg.DeadTimeout = 10 * time.Second
+	}
 	if cfg.Clock == nil {
 		cfg.Clock = systemClock{}
 	}
@@ -159,6 +188,7 @@ func NewNode(list *member.List, tr transport.Transport, cfg Config) *Node {
 		clock:      cfg.Clock,
 		pending:    map[uint64]chan struct{}{},
 		suspicions: map[member.ID]*suspicionTimer{},
+		evictions:  map[member.ID]*evictionTimer{},
 	}
 }
 
@@ -170,6 +200,7 @@ func NewNode(list *member.List, tr transport.Transport, cfg Config) *Node {
 // and List, both of which outlive Run).
 func (n *Node) Run(ctx context.Context) {
 	defer n.stopSuspicionTimers()
+	defer n.stopEvictionTimers()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -237,7 +268,11 @@ func (n *Node) collectGossip(exclude map[member.ID]bool) []protocol.Update {
 // the reply would delay spreading the correction on the very Ack answering
 // the slur. For everyone else, a freshly-absorbed Suspect arms this node's
 // own local suspicion timer (SWIM: every node that hears a Suspect times it
-// independently), and fresh Alive/Dead information cancels an obsolete one.
+// independently), and fresh Alive information cancels an obsolete one. Этап 6
+// adds a third: a freshly-absorbed Dead also arms this node's own eviction
+// timer (gossip-delivered deaths must eventually be forgotten, not only
+// locally-escalated ones), and Alive cancels that too — see armEviction/
+// cancelEviction below.
 func (n *Node) applyGossip(ups []protocol.Update) map[member.ID]bool {
 	if len(ups) == 0 {
 		return nil
@@ -260,8 +295,16 @@ func (n *Node) applyGossip(ups []protocol.Update) map[member.ID]bool {
 		switch u.State {
 		case member.StateSuspect:
 			n.armSuspicion(m)
-		case member.StateAlive, member.StateDead:
+		case member.StateDead:
 			n.cancelSuspicion(u.ID, u.Incarnation, u.State)
+			// A death learned by rumor (not only by our own escalation) must
+			// also start THIS node's grace timer, or a gossip-delivered Dead
+			// would linger forever. armEviction is idempotent per (ID, inc),
+			// so repeated Dead rumors never double a timer.
+			n.armEviction(m)
+		case member.StateAlive:
+			n.cancelSuspicion(u.ID, u.Incarnation, u.State)
+			n.cancelEviction(u.ID, u.Incarnation, u.State)
 		}
 	}
 	return seen
@@ -623,6 +666,75 @@ func (n *Node) escalate(id member.ID, addr string, inc uint64) {
 		State:       member.StateDead,
 	}) {
 		log.Printf("swim: %s unrefuted for %v — declaring dead (incarnation %d)", id, n.cfg.SuspicionTimeout, inc)
+		// The target just became Dead in our local view: start the grace
+		// period after which the record is forgotten entirely.
+		n.armEviction(member.Member{ID: id, Addr: addr, Incarnation: inc})
+	}
+}
+
+// armEviction arms the Dead→evicted removal timer for target, valid for
+// target.Incarnation. Idempotent per (ID, incarnation): a repeat at the same
+// (or older) incarnation is a no-op, so eviction fires at most once per
+// incarnation. A Dead at a HIGHER incarnation replaces the armed timer (the
+// old one is obsolete by precedence). Mirror of armSuspicion.
+func (n *Node) armEviction(target member.Member) {
+	n.evictMu.Lock()
+	defer n.evictMu.Unlock()
+	if cur, ok := n.evictions[target.ID]; ok {
+		if cur.incarnation >= target.Incarnation {
+			return
+		}
+		cur.timer.Stop()
+	}
+	id, inc := target.ID, target.Incarnation
+	n.evictions[id] = &evictionTimer{
+		incarnation: inc,
+		timer: n.clock.AfterFunc(n.cfg.DeadTimeout, func() {
+			n.evict(id, inc)
+		}),
+	}
+}
+
+// cancelEviction disarms target's eviction timer when the record leaves Dead:
+// a revive (Alive) at a HIGHER incarnation resurrects the node, so it must no
+// longer be evicted. (A Dead at a higher incarnation is handled by armEviction
+// re-arming.) Mirror of cancelSuspicion, but the trigger is "no longer
+// Dead@inc". A Suspect at a higher incarnation deliberately does NOT disarm:
+// the node is under suspicion again and must not be forgotten by the old
+// timer — arm/cancel stay symmetric with the suspicion logic.
+func (n *Node) cancelEviction(id member.ID, inc uint64, state member.State) {
+	n.evictMu.Lock()
+	defer n.evictMu.Unlock()
+	cur, ok := n.evictions[id]
+	if !ok {
+		return
+	}
+	if state != member.StateAlive || inc <= cur.incarnation {
+		return
+	}
+	cur.timer.Stop()
+	delete(n.evictions, id)
+}
+
+// evict is the eviction timer's payload: the grace period elapsed with the
+// target still Dead, so remove it from the list. Guard mirrors escalate: if
+// the map entry was disarmed or re-armed at a newer incarnation between the
+// timer firing and this callback, it is not ours to evict. The actual removal
+// goes through member.List.Evict, which re-checks Dead@inc under the list lock
+// (a revive racing the timer then makes Evict a no-op — precedence has the
+// final word, same as escalate → Merge).
+func (n *Node) evict(id member.ID, inc uint64) {
+	n.evictMu.Lock()
+	cur, ok := n.evictions[id]
+	if !ok || cur.incarnation != inc {
+		n.evictMu.Unlock()
+		return
+	}
+	delete(n.evictions, id)
+	n.evictMu.Unlock()
+
+	if n.list.Evict(id, inc) {
+		log.Printf("swim: evicting %s after %v dead (incarnation %d)", id, n.cfg.DeadTimeout, inc)
 	}
 }
 
@@ -637,6 +749,17 @@ func (n *Node) stopSuspicionTimers() {
 	}
 }
 
+// stopEvictionTimers disarms every pending eviction timer; Run defers it so no
+// eviction outlives the node's ctx (mirror of stopSuspicionTimers).
+func (n *Node) stopEvictionTimers() {
+	n.evictMu.Lock()
+	defer n.evictMu.Unlock()
+	for id, cur := range n.evictions {
+		cur.timer.Stop()
+		delete(n.evictions, id)
+	}
+}
+
 // probeOnce probes a single random peer in up to two phases sharing one SeqNo
 // and one pending channel. Phase 1: direct Ping, wait RTTTimeout. Phase 2 (only
 // if phase 1 stayed silent): fan a PingReq out to up to K mediators and wait
@@ -646,15 +769,25 @@ func (n *Node) stopSuspicionTimers() {
 // live node must not get it declared dead (the project's central invariant).
 func (n *Node) probeOnce(ctx context.Context) {
 	others := n.list.Others()
-	if len(others) == 0 {
-		return // single-node cluster: nobody to probe
+	targets := make([]member.Member, 0, len(others))
+	for _, m := range others {
+		if m.State == member.StateDead {
+			// A Dead record is being gossiped out and will be evicted shortly;
+			// probing it only yields timeout noise (Этап 6). Suspect targets
+			// stay in — they are still under active probing by design.
+			continue
+		}
+		targets = append(targets, m)
+	}
+	if len(targets) == 0 {
+		return // nobody probeable (single node, or every peer already Dead)
 	}
 
 	// cfg.Rand (*rand.Rand) is not safe for concurrent use; share n.mu with
 	// seqNo/pending rather than add a second lock (pickMediators draws from
 	// the same Rand, possibly concurrently with mediator goroutines).
 	n.mu.Lock()
-	target := others[n.cfg.Rand.Intn(len(others))]
+	target := targets[n.cfg.Rand.Intn(len(targets))]
 	n.mu.Unlock()
 
 	seq, ackCh := n.registerProbe()
