@@ -347,3 +347,100 @@ func TestList_MembersSorted(t *testing.T) {
 		t.Errorf("Members() IDs = %v, want %v", gotIDs, want)
 	}
 }
+
+// ---- Этап 6: Evict ------------------------------------------------------
+
+func TestList_Evict_RemovesDeadRecord(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", State: StateAlive})
+	l.Merge(Member{ID: "B", Addr: "B", Incarnation: 4, State: StateDead})
+
+	if !l.Evict("B", 4) {
+		t.Fatal("Evict(B, 4) = false, want true for a Dead@4 record")
+	}
+	if _, ok := l.Get("B"); ok {
+		t.Error("Get(B) still known after Evict, want gone")
+	}
+	for _, m := range l.Members() {
+		if m.ID == "B" {
+			t.Error("Members() still contains B after Evict")
+		}
+	}
+	for _, m := range l.Others() {
+		if m.ID == "B" {
+			t.Error("Others() still contains B after Evict")
+		}
+	}
+}
+
+// TestList_Evict_DropsGossipTx is the direct test on PendingGossip's bare
+// *l.members[id] dereference after an eviction — the central tech debt of the
+// stage: Evict must drop the gossipTx key together with the members key, or
+// PendingGossip would dereference nil.
+func TestList_Evict_DropsGossipTx(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", State: StateAlive})
+	l.Merge(Member{ID: "B", Addr: "B", Incarnation: 4, State: StateDead}) // arms gossipTx["B"]
+
+	if !l.Evict("B", 4) {
+		t.Fatal("Evict(B, 4) = false, want true")
+	}
+	// Must neither panic nor return the evicted record.
+	for _, m := range l.PendingGossip(10, nil) {
+		if m.ID == "B" {
+			t.Error("PendingGossip returned evicted B — gossipTx key not dropped")
+		}
+	}
+}
+
+func TestList_Evict_GuardsIncarnation(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", State: StateAlive})
+	l.Merge(Member{ID: "B", Addr: "B", Incarnation: 4, State: StateDead})
+
+	if l.Evict("B", 3) {
+		t.Error("Evict(B, 3) = true, want false — older incarnation must not evict")
+	}
+	if _, ok := l.Get("B"); !ok {
+		t.Fatal("B gone after rejected Evict(B, 3)")
+	}
+	if l.Evict("B", 5) {
+		t.Error("Evict(B, 5) = true, want false — incarnation mismatch must not evict")
+	}
+	if _, ok := l.Get("B"); !ok {
+		t.Fatal("B gone after rejected Evict(B, 5)")
+	}
+	if !l.Evict("B", 4) {
+		t.Error("Evict(B, 4) = false, want true — exact Dead@4 match must evict")
+	}
+}
+
+func TestList_Evict_GuardsState(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", State: StateAlive})
+	l.Merge(Member{ID: "B", Addr: "B", Incarnation: 4, State: StateAlive})
+
+	if l.Evict("B", 4) {
+		t.Error("Evict(B, 4) = true on an Alive record, want false — only Dead evicts")
+	}
+	if rec, ok := l.Get("B"); !ok || rec.State != StateAlive {
+		t.Fatalf("B = %+v (known=%v) after rejected Evict, want alive and present", rec, ok)
+	}
+}
+
+func TestList_Evict_Unknown(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", State: StateAlive})
+	if l.Evict("Z", 0) {
+		t.Error("Evict(Z, 0) = true on an unknown ID, want false")
+	}
+}
+
+func TestList_Evict_NeverSelf(t *testing.T) {
+	l := NewList(Member{ID: "A", Addr: "A", State: StateAlive})
+	// Artificially force self Dead (equal incarnation: Dead outranks Alive) to
+	// prove the self guard holds even then.
+	l.Merge(Member{ID: "A", Addr: "A", Incarnation: 0, State: StateDead})
+
+	if l.Evict("A", 0) {
+		t.Error("Evict(self) = true, want false — self is never evicted")
+	}
+	if _, ok := l.Get("A"); !ok {
+		t.Error("self record gone after Evict(self), want kept")
+	}
+}
